@@ -58,12 +58,20 @@ the cards:
 nlclient's code pages get evicted and re-read from the compressed JFFS2. It
 stalls, misses 8 heartbeats, and nlheartbeatd restarts the unit.
 
+Showing the cards full size only (no zoomed-out chooser, no shrunk cards)
+lowered the CPU load (frames of 21–115 ms, 10–19 a second), but nestlocal
+still grows from 8 to 22 MB. The UI keeps many full frames, at 900 KB each:
+the dial saved every 3 s, the dial's other colour (`stills`), list layers,
+the recolour frame, nlclient's saved frame, home, each card, `scratch` and
+`shown`. Reads of the display also allocate temporaries.
+
 Next steps:
-1. Keep fewer full frames in memory on the gen 2 (the card cache, the shrunk
-   cards).
-2. Use lighter transitions on the gen 2 (no zoomed-out chooser).
-3. Render at 320 natively instead of 480 then scaling.
-4. Leave out what isn't used (Matter, Zigbee) to make nestlocal smaller.
+1. Render at 320 natively instead of 480 then scaling. Every one of those
+   frames drops to 410 KB, and the scaling pass goes away.
+2. Until then, make `Display::put` faster: on the gen 2 most of a frame's time
+   is `copy`. That's the 2/3 scale and quarter turn, which reads the frame
+   column-wise. Tiles, or a cached scratch page copied out in rows, would help.
+3. Leave out what isn't used (Matter, Zigbee) to make nestlocal smaller.
 
 ## Working on a unit
 
