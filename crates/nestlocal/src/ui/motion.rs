@@ -290,13 +290,14 @@ pub fn press(frame: &mut [u8], pressed: Pressed) {
     match pressed {
         Pressed::Screen => {
             // Lifting the whole square greyed the dark round the ring.
-            for r in 0..SIDE {
-                let dx = r as f32 + 0.5 - CENTRE;
-                for c in 0..SIDE {
-                    let dy = c as f32 + 0.5 - CENTRE;
-                    let near = 1.0 - (dx * dx + dy * dy) / (PRESS_RADIUS * PRESS_RADIUS);
+            let radius = PRESS_RADIUS * k;
+            for r in 0..side {
+                let dx = r as f32 + 0.5 - centre;
+                for c in 0..side {
+                    let dy = c as f32 + 0.5 - centre;
+                    let near = 1.0 - (dx * dx + dy * dy) / (radius * radius);
                     if near > 0.0 {
-                        lift(&mut pixels[r * SIDE + c], (PRESS_LIFT * near) as u32);
+                        lift(&mut pixels[r * side + c], (PRESS_LIFT * near) as u32);
                     }
                 }
             }

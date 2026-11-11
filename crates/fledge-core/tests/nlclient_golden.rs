@@ -510,7 +510,12 @@ fn reviewed_builds_share_their_natives_library_calls() {
             .filter(|(name, calls)| !others.iter().any(|v| v["imports"][name.as_str()] == json!(calls)))
             .map(|(name, _)| name.as_str())
             .collect();
-        let allowed = if own == "2025-6.5-14" { 5 } else { 1 };
+        // The gen 2 alone presents through the framebuffer (native_fb_present).
+        let allowed = match own.as_str() {
+            "2025-6.5-14" => 5,
+            "2019-gen2" => 2,
+            _ => 1,
+        };
         assert!(unmatched.len() <= allowed, "{}: no other reviewed build's natives call what these do: {unmatched:?}", path.display());
     }
 }
