@@ -198,8 +198,12 @@ pub struct Display {
     map: *mut u8,
     len: usize,
     stride: usize,
-    /// The panel's side: SIDE, or SMALL (the gen 2).
+    /// The panel's side in pixels, as a Frame has it (paint::side).
     side: usize,
+    /// Whether the panel shows the framebuffer turned a quarter clockwise,
+    /// as a Frame is laid out for (the gen 3's). The gen 2's shows it as it
+    /// is, so a Frame is turned back a quarter on its way.
+    turned: bool,
     /// While the UI owns the display, it draws into the page that isn't
     /// shown and then pans to it, so no frame shows half drawn.
     flip: Option<Flip>,
@@ -258,45 +262,54 @@ impl Display {
         if map == libc::MAP_FAILED {
             return Err(format!("/dev/fb0: mmap: {}", std::io::Error::last_os_error()));
         }
-        Ok(Display { file, map: map.cast(), len, stride, side, flip: None, shown: vec![0; SIDE * ROW] })
+        Ok(Display { file, map: map.cast(), len, stride, side, turned: side == SIDE, flip: None,
+                     shown: vec![0; side * side * 4] })
+    }
+
+    /// The panel's side in pixels.
+    pub fn side(&self) -> usize {
+        self.side
     }
 
     /// Writes the frame's rows `first` to `last` into a page: as they are,
-    /// or on the gen 2 the panel's columns they make, scaled by 2/3 and
-    /// turned back a quarter, its panel showing the framebuffer unturned.
-    fn put(page: &mut [u8], stride: usize, side: usize, frame: &[u8], first: usize, last: usize) {
-        if side == SIDE {
-            for y in first..=last.min(SIDE - 1) {
-                page[y * stride..y * stride + ROW].copy_from_slice(&frame[y * ROW..(y + 1) * ROW]);
+    /// or on the gen 2 the panel's columns they make, turned back a quarter.
+    fn put(page: &mut [u8], stride: usize, side: usize, turned: bool, frame: &[u8], first: usize, last: usize) {
+        let row = side * 4;
+        let last = last.min(side - 1);
+        if turned {
+            for y in first..=last {
+                page[y * stride..y * stride + row].copy_from_slice(&frame[y * row..(y + 1) * row]);
             }
             return;
         }
-        let (from, to) = (first * 2 / 3, (last * 2 / 3 + 1).min(SMALL - 1));
-        let mut line = [0u8; SMALL * 4];
-        for y in 0..SMALL {
-            panel_row(frame, y, from, to, &mut line);
-            page[y * stride + from * 4..y * stride + (to + 1) * 4].copy_from_slice(&line[from * 4..(to + 1) * 4]);
+        // The panel's pixel (x, y) is the frame's row x, column side - 1 - y;
+        // each panel row's run written whole (its memory is slow a pixel at a time).
+        let mut line = vec![0u8; row];
+        for y in 0..side {
+            let column = (side - 1 - y) * 4;
+            for x in first..=last {
+                let at = x * row + column;
+                line[x * 4..x * 4 + 4].copy_from_slice(&frame[at..at + 4]);
+            }
+            page[y * stride + first * 4..y * stride + (last + 1) * 4].copy_from_slice(&line[first * 4..(last + 1) * 4]);
         }
     }
 
-    /// A page as a Frame: the gen 2's scaled by 3/2 and turned a quarter,
-    /// from a copy read in whole rows (its memory is slow a pixel at a time).
-    fn take(page: &[u8], stride: usize, side: usize) -> Frame {
-        let mut frame = Vec::with_capacity(SIDE * ROW);
-        if side == SIDE {
-            for y in 0..SIDE {
-                frame.extend_from_slice(&page[y * stride..y * stride + ROW]);
-            }
-            return frame;
+    /// A page as a Frame, from a copy read in whole rows (its memory is slow
+    /// a pixel at a time): on the gen 2 turned a quarter, as put() undoes.
+    fn take(page: &[u8], stride: usize, side: usize, turned: bool) -> Frame {
+        let row = side * 4;
+        let mut panel = Vec::with_capacity(side * row);
+        for y in 0..side {
+            panel.extend_from_slice(&page[y * stride..y * stride + row]);
         }
-        let mut panel = vec![0u8; SMALL * SMALL * 4];
-        for y in 0..SMALL {
-            panel[y * SMALL * 4..(y + 1) * SMALL * 4].copy_from_slice(&page[y * stride..y * stride + SMALL * 4]);
+        if turned {
+            return panel;
         }
-        for y in 0..SIDE {
-            let column = y * 2 / 3 * 4;
-            for x in 0..SIDE {
-                let at = (SIDE - 1 - x) * 2 / 3 * SMALL * 4 + column;
+        let mut frame = Vec::with_capacity(side * row);
+        for x in 0..side {
+            for c in 0..side {
+                let at = (side - 1 - c) * row + x * 4;
                 frame.extend_from_slice(&panel[at..at + 4]);
             }
         }
@@ -351,9 +364,9 @@ impl Display {
         // The gen 2's nlclient goes on drawing into the page it doesn't
         // show (its present is skipped, not its drawing): the UI keeps to the
         // one shown, drawing straight on it.
-        let pages = if self.side == SIDE { [0, rows / 2] } else { [self.pan(); 2] };
-        let home = usize::from(self.side == SIDE && self.pan() >= rows / 2);
-        self.flip = Some(Flip { pages, front: home, home, stale: [Some((0, SIDE - 1)); 2] });
+        let pages = if self.turned { [0, rows / 2] } else { [self.pan(); 2] };
+        let home = usize::from(self.turned && self.pan() >= rows / 2);
+        self.flip = Some(Flip { pages, front: home, home, stale: [Some((0, self.side - 1)); 2] });
     }
 
     /// Gives the display back showing `frame` (nlclient's) on nlclient's
@@ -361,8 +374,8 @@ impl Display {
     pub fn end(&mut self, frame: &[u8]) {
         let Some(flip) = self.flip.take() else { return self.show(frame) };
         let start = flip.pages[flip.home] * self.stride;
-        let (stride, side) = (self.stride, self.side);
-        Self::put(&mut self.bytes()[start..], stride, side, frame, 0, SIDE - 1);
+        let (stride, side, turned) = (self.stride, self.side, self.turned);
+        Self::put(&mut self.bytes()[start..], stride, side, turned, frame, 0, side - 1);
         if let Err(e) = self.pan_to(flip.pages[flip.home]) {
             crate::logf!("ui: pan: {e}");
         }
@@ -371,28 +384,29 @@ impl Display {
     /// Writes rows into the page to show next and flips to it: `rows`
     /// those changed (None, all), each given by `each`.
     fn present(&mut self, rows: Option<(usize, usize)>, mut each: impl FnMut(usize, &mut [u8])) {
-        let (stride, side) = (self.stride, self.side);
+        let (stride, side, turned) = (self.stride, self.side, self.turned);
+        let row = side * 4;
         let Some(flip) = self.flip.as_mut() else {
             let start = self.page();
-            let (first, last) = rows.unwrap_or((0, SIDE - 1));
-            if side != SIDE {
-                for y in first..=last.min(SIDE - 1) {
-                    each(y, &mut self.shown[y * ROW..(y + 1) * ROW]);
+            let (first, last) = rows.unwrap_or((0, side - 1));
+            if !turned {
+                for y in first..=last.min(side - 1) {
+                    each(y, &mut self.shown[y * row..(y + 1) * row]);
                 }
                 // SAFETY: map is len bytes, mapped for this Display's life; shown is a separate field.
                 let page = unsafe { std::slice::from_raw_parts_mut(self.map.add(start), self.len - start) };
-                return Self::put(page, stride, side, &self.shown, first, last);
+                return Self::put(page, stride, side, turned, &self.shown, first, last);
             }
             let page = &mut self.bytes()[start..];
-            for y in first..=last.min(SIDE - 1) {
-                each(y, &mut page[y * stride..y * stride + ROW]);
+            for y in first..=last.min(side - 1) {
+                each(y, &mut page[y * stride..y * stride + row]);
             }
             return;
         };
         let back = 1 - flip.front;
-        let all = Some((0, SIDE - 1));
+        let all = Some((0, side - 1));
         let changed = if rows.is_none() { all } else { rows };
-        let (first, last) = union(changed, flip.stale[back]).unwrap_or((0, SIDE - 1));
+        let (first, last) = union(changed, flip.stale[back]).unwrap_or((0, side - 1));
         flip.stale[back] = None;
         flip.stale[flip.front] = union(flip.stale[flip.front], changed);
         flip.front = back;
@@ -402,22 +416,22 @@ impl Display {
         let page = unsafe { std::slice::from_raw_parts_mut(self.map.add(start), self.len - start) };
         let shown = &mut self.shown;
         prof::time(prof::Part::Copy, || {
-            for row in first..=last.min(SIDE - 1) {
-                let line = &mut shown[row * ROW..(row + 1) * ROW];
-                each(row, line);
-                if side == SIDE {
-                    page[row * stride..row * stride + ROW].copy_from_slice(line);
+            for r in first..=last.min(side - 1) {
+                let line = &mut shown[r * row..(r + 1) * row];
+                each(r, line);
+                if turned {
+                    page[r * stride..r * stride + row].copy_from_slice(line);
                 }
             }
-            if side != SIDE {
-                Self::put(page, stride, side, shown, first, last);
+            if !turned {
+                Self::put(page, stride, side, turned, shown, first, last);
             }
         });
         // For tools (utils/nest-screen.py): the frame about to show, whole,
         // where reading the framebuffer could catch the next one being drawn.
         if std::fs::remove_file(CAPTURE_REQUEST).is_ok() {
-            let frame = if side == SIDE {
-                (0..SIDE).flat_map(|row| page[row * stride..row * stride + ROW].to_vec()).collect()
+            let frame = if turned {
+                (0..side).flat_map(|r| page[r * stride..r * stride + row].to_vec()).collect()
             } else {
                 shown.clone()
             };
@@ -433,11 +447,11 @@ impl Display {
         unsafe { std::slice::from_raw_parts_mut(self.map, self.len) }
     }
 
-    /// The visible page's top 480 rows as a Frame: what nlclient shows.
+    /// The visible page as a Frame: what nlclient shows.
     pub fn save(&mut self) -> Frame {
-        let (start, stride, side) = (self.page(), self.stride, self.side);
+        let (start, stride, side, turned) = (self.page(), self.stride, self.side, self.turned);
         let page = &self.bytes()[start..];
-        prof::time(prof::Part::Read, || Self::take(page, stride, side))
+        prof::time(prof::Part::Read, || Self::take(page, stride, side, turned))
     }
 
     /// What shows: the UI's own last frame while it has the display (and
@@ -451,78 +465,58 @@ impl Display {
 
     /// Shows a Frame.
     pub fn show(&mut self, frame: &[u8]) {
-        self.present(None, |y, row| row.copy_from_slice(&frame[y * ROW..(y + 1) * ROW]));
+        let row = self.side * 4;
+        self.present(None, |y, line| line.copy_from_slice(&frame[y * row..(y + 1) * row]));
     }
 
     /// Shows a Frame of which only rows `first` to `last` changed.
     pub fn show_rows(&mut self, frame: &[u8], first: usize, last: usize) {
-        self.present(Some((first, last)), |y, row| row.copy_from_slice(&frame[y * ROW..(y + 1) * ROW]));
+        let row = self.side * 4;
+        self.present(Some((first, last)), |y, line| line.copy_from_slice(&frame[y * row..(y + 1) * row]));
     }
 
-    /// `from` sliding out and `to` in by `by` pixels of 480, sideways as the
+    /// `from` sliding out and `to` in by `by` pixels, sideways as the
     /// display stands: the framebuffer's rows, as it is mounted turned.
     pub fn slide(&mut self, from: &[u8], to: &[u8], by: usize, clockwise: bool) {
-        let by = by.min(SIDE);
-        self.present(None, |y, row| {
+        let (side, row) = (self.side, self.side * 4);
+        let by = by.min(side);
+        self.present(None, |y, line| {
             let (source, at) = if clockwise {
-                if y + by < SIDE { (from, y + by) } else { (to, y + by - SIDE) }
-            } else if y >= by { (from, y - by) } else { (to, y + SIDE - by) };
-            row.copy_from_slice(&source[at * ROW..(at + 1) * ROW]);
+                if y + by < side { (from, y + by) } else { (to, y + by - side) }
+            } else if y >= by { (from, y - by) } else { (to, y + side - by) };
+            line.copy_from_slice(&source[at * row..(at + 1) * row]);
         });
     }
 
     /// `to` over `from` at `alpha` of 256.
     pub fn fade(&mut self, from: &[u8], to: &[u8], alpha: u16) {
         let alpha = alpha.min(256) as u32;
-        let mut line = [0u8; ROW];
-        self.present(None, |y, row| {
-            let (a, b) = (&from[y * ROW..(y + 1) * ROW], &to[y * ROW..(y + 1) * ROW]);
+        let row = self.side * 4;
+        let mut blended = vec![0u8; row];
+        self.present(None, |y, line| {
+            let (a, b) = (&from[y * row..(y + 1) * row], &to[y * row..(y + 1) * row]);
             // A pixel at a time, two channels to a multiply (blue and red,
             // then green and the unused byte), into a line written to the
             // framebuffer whole: its memory is slow a byte at a time.
-            for ((out, a), b) in line.as_chunks_mut::<4>().0.iter_mut().zip(a.as_chunks::<4>().0).zip(b.as_chunks::<4>().0) {
+            for ((out, a), b) in blended.as_chunks_mut::<4>().0.iter_mut().zip(a.as_chunks::<4>().0).zip(b.as_chunks::<4>().0) {
                 let (a, b) = (u32::from_le_bytes(*a), u32::from_le_bytes(*b));
                 let even = ((a & 0x00ff_00ff) * (256 - alpha) + (b & 0x00ff_00ff) * alpha) >> 8 & 0x00ff_00ff;
                 let odd = (((a >> 8) & 0x00ff_00ff) * (256 - alpha) + ((b >> 8) & 0x00ff_00ff) * alpha) & 0xff00_ff00;
                 *out = (even | odd).to_le_bytes();
             }
-            row.copy_from_slice(&line);
+            line.copy_from_slice(&blended);
         });
     }
 
 }
 
-/// The display's side, and a framebuffer row of it in bytes.
+/// The gen 3's display side; the gen 2's.
 const SIDE: usize = 480;
-const ROW: usize = SIDE * 4;
-/// The gen 2's display side: 2/3 of SIDE.
 const SMALL: usize = 320;
 
-/// Of the three frame rows or columns a gen 2 pixel's two come from, the
-/// nearer and the middle one.
-fn thirds(at: usize) -> (usize, usize) {
-    (3 * (at / 2) + at % 2 * 2, 3 * (at / 2) + 1)
-}
-
-/// The gen 2 panel's row `y`, pixels `from` to `to`, from a Frame: the Frame
-/// turned back a quarter (the panel's row y is its column SMALL - 1 - y),
-/// each 3x3 pixels to 2x2, weighted 2:1 towards the nearer of the three.
-fn panel_row(frame: &[u8], y: usize, from: usize, to: usize, out: &mut [u8; SMALL * 4]) {
-    let (cn, cf) = thirds(SMALL - 1 - y);
-    let (cn, cf) = (cn * 4, cf * 4);
-    for x in from..=to {
-        let (rn, rf) = thirds(x);
-        let (a, b) = (&frame[rn * ROW..(rn + 1) * ROW], &frame[rf * ROW..(rf + 1) * ROW]);
-        for c in 0..4 {
-            let v = 4 * a[cn + c] as u32 + 2 * (a[cf + c] as u32 + b[cn + c] as u32) + b[cf + c] as u32;
-            out[x * 4 + c] = (v / 9) as u8;
-        }
-    }
-}
-
-/// A screen as the framebuffer holds it: 480 rows of 480 BGRX pixels, the
-/// picture turned a quarter anticlockwise, as the panel shows the
-/// framebuffer turned a quarter clockwise.
+/// A screen as the framebuffer holds it: the panel's side (paint::side) in
+/// rows of as many BGRX pixels, the picture turned a quarter anticlockwise,
+/// as the gen 3's panel shows the framebuffer turned a quarter clockwise.
 pub type Frame = Vec<u8>;
 
 /// A screen drawn for the panel (paint::for_panel) as a Frame: as it is.
@@ -684,32 +678,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_gen_2_panel_shows_a_frame_at_two_thirds() {
-        // A frame of 3x3 blocks, each one value: each comes out a 2x2 block.
-        let mut frame = vec![0u8; SIDE * ROW];
-        for y in 0..SIDE {
-            for x in 0..SIDE {
-                let v = ((x / 3 + y / 3) % 2 * 200) as u8;
-                frame[y * ROW + x * 4..y * ROW + x * 4 + 4].copy_from_slice(&[v, v, v, 0]);
-            }
-        }
-        let mut line = [0u8; SMALL * 4];
-        for y in 0..SMALL {
-            panel_row(&frame, y, 0, SMALL - 1, &mut line);
-            for x in 0..SMALL {
-                // Turned back a quarter: the panel's (x, y) is the frame's (319 - y, x).
-                let want = (((SMALL - 1 - y) / 2 + x / 2) % 2 * 200) as u8;
-                assert_eq!(line[x * 4..x * 4 + 4], [want, want, want, 0], "({x}, {y})");
-            }
-        }
+    fn a_gen_2_page_is_the_frame_turned_back_a_quarter() {
+        let (side, row) = (SMALL, SMALL * 4);
+        let mut frame = vec![0u8; side * row];
+        // Frame row 10 (upright column 10), column 20 (upright y 299).
+        frame[10 * row + 20 * 4] = 9;
+        let mut page = vec![0u8; side * row];
+        Display::put(&mut page, row, side, false, &frame, 0, side - 1);
+        // Shown upright at x 10, y 299: the panel's row 299, column 10.
+        assert_eq!(page[299 * row + 10 * 4], 9);
+        assert_eq!(Display::take(&page, row, side, false), frame, "read back as it was");
     }
 
     #[test]
-    fn a_gen_2_page_reads_back_at_480() {
-        let mut page = vec![0u8; SMALL * SMALL * 4];
-        page[(10 * SMALL + 20) * 4] = 9;
-        let frame = Display::take(&page, SMALL * 4, SMALL);
-        assert_eq!(frame.len(), SIDE * ROW);
-        assert_eq!(frame[(30 * SIDE + 464) * 4], 9);
+    fn a_gen_3_page_is_the_frame() {
+        let (side, row) = (SIDE, SIDE * 4);
+        let mut frame = vec![0u8; side * row];
+        frame[10 * row + 20 * 4] = 9;
+        let mut page = vec![0u8; side * row];
+        Display::put(&mut page, row, side, true, &frame, 0, side - 1);
+        assert_eq!(page, frame);
+        assert_eq!(Display::take(&page, row, side, true), frame);
     }
 }

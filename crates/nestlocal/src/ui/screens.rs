@@ -728,7 +728,7 @@ fn theme_preview(fonts: &Fonts, theme: paint::Theme) -> (Vec<u8>, u32) {
     let rgb = p.rgb_upright();
     paint::set_theme(shown);
     // The whole dial, its ring round the edge.
-    (rgb, paint::SIZE)
+    (rgb, p.side())
 }
 
 /// Settings' Theme, as its mockup: the two looks side by side, each a small

@@ -277,6 +277,8 @@ pub fn start(ui: Arc<Ui>, sender: Arc<dyn Sender>) {
         device::backlight(true);
         device::favour();
         paint::for_panel();
+        // Drawn at the panel's own size: the gen 2's is 320 pixels across.
+        paint::set_side(display.side() as u32);
         let _ = std::thread::Builder::new().name("ui-warm".into()).spawn(paint::warm);
         // The thermostat's own commands (an update's install) may start work
         // on nestlocal's runtime.
@@ -574,7 +576,7 @@ impl Runtime {
             alerts: 0, alarm_results: 0, glance_tries: 0, ran: None, glance_minute: 0, backlight_off: false, nest_alerts: NEST_ALERTS.load(std::sync::atomic::Ordering::Relaxed),
             seen: (SEEN_FAR.load(std::sync::atomic::Ordering::Relaxed), SEEN_NEAR.load(std::sync::atomic::Ordering::Relaxed)),
             rest: false, black: false, beat: 0, last_beat: now,
-            scratch: vec![0; (paint::SIZE * paint::SIZE * 4) as usize], sweep: None, live: None, ticker: None, last_frame: now,
+            scratch: vec![0; (paint::side() * paint::side() * 4) as usize], sweep: None, live: None, ticker: None, last_frame: now,
             last_check: now - Duration::from_secs(10), last_nudge: None, nlclient: false, frames: Default::default(), spent: Default::default(), paced: Default::default(),
             pressed: None, back_chosen: None, back_since: None, native_input: now, settings_checked: now, settings_seen: 0, native_settings: false,
             nest_checked: now - Duration::from_secs(10), pulse: None, next_pulse: now, glide: None, force_draw: false, last_click: now, cards_stale: false, home_from: None, set_words: false, volume_view: false, progress_drawn: now, fade_next: false,
@@ -1324,7 +1326,7 @@ impl Runtime {
             key => cards.get(&key).map(Vec::as_slice),
         };
         if let (Some(from), Some(to)) = (get(from), get(to)) {
-            self.display.slide(from, to, (part * paint::SIZE as f32) as usize, true);
+            self.display.slide(from, to, (part * paint::side() as f32) as usize, true);
         }
     }
 
@@ -1529,7 +1531,7 @@ impl Runtime {
         self.prepare(at);
         let index = self.key(at);
         let frame = if index == 0 { self.home.clone() } else { self.cards.get(&index).cloned() };
-        frame.unwrap_or_else(|| vec![0; (paint::SIZE * paint::SIZE * 4) as usize])
+        frame.unwrap_or_else(|| vec![0; (paint::side() * paint::side() * 4) as usize])
     }
 
     /// How far the ring of the mode's value should show (0..1), if it has one.
@@ -1976,7 +1978,7 @@ impl Runtime {
                 return;
             }
             self.black = true;
-            let black = vec![0; (paint::SIZE * paint::SIZE * 4) as usize];
+            let black = vec![0; (paint::side() * paint::side() * 4) as usize];
             let kind = std::mem::replace(&mut self.transition, Transition::Cut);
             self.transit(&black, kind);
             self.live = None;
@@ -2569,6 +2571,13 @@ fn home_dial(display: &mut device::Display) -> bool {
 
 /// Whether a frame of nlclient's is its home dial, drawn: nlclient says it
 /// shows its dial as its menu starts closing, so the frame must look it too.
+/// Whether a page is the gen 3's, 480 a side: what nlclient's screens are
+/// recognised on by their pixels. The gen 2's are told by nlclient's report
+/// (nlstate) alone.
+fn gen3_page(page: &[u8]) -> bool {
+    page.len() == 480 * 480 * 4
+}
+
 fn dial_page(page: &[u8]) -> bool {
     dial(page) && nlstate::read().is_none_or(|report| report.shows() == Shows::Dial)
 }
@@ -2592,6 +2601,9 @@ fn menu_shows(display: &mut device::Display) -> bool {
 /// middle, black near the edge above and below it (a cooling dial is blue
 /// all over).
 fn settings_tile(page: &[u8]) -> bool {
+    if !gen3_page(page) {
+        return false;
+    }
     let stride = page.len() / 480;
     let blue = |x: f32, y: f32| {
         let (x, y) = (x.round() as usize, y.round() as usize);
@@ -2623,6 +2635,9 @@ fn settings_tile(page: &[u8]) -> bool {
 /// Whether nlclient's menu shows with Back chosen: its arrow, lower left,
 /// blue (unchosen it is grey).
 fn back_chosen(page: &[u8]) -> bool {
+    if !gen3_page(page) {
+        return false;
+    }
     let stride = page.len() / 480;
     let mut blue = 0;
     for x in 78..146 {
@@ -2639,6 +2654,9 @@ fn back_chosen(page: &[u8]) -> bool {
 /// Whether nlclient's menu shows Settings chosen: its cog, below the
 /// date, lit white.
 fn settings_chosen(page: &[u8]) -> bool {
+    if !gen3_page(page) {
+        return false;
+    }
     let stride = page.len() / 480;
     let mut white = 0;
     for x in 160..222 {
@@ -2658,6 +2676,9 @@ fn blank(page: &[u8]) -> bool {
 
 /// Whether a frame shows nlclient's home dial: its ring lit around the edge.
 fn dial(page: &[u8]) -> bool {
+    if !gen3_page(page) {
+        return false;
+    }
     if off_dial(page) {
         return true;
     }
@@ -2680,6 +2701,9 @@ fn dial(page: &[u8]) -> bool {
 /// middle, and nothing else white (its menus have white icons round the
 /// edge, its Settings tiles are blue).
 fn off_dial(page: &[u8]) -> bool {
+    if !gen3_page(page) {
+        return false;
+    }
     let stride = page.len() / 480;
     let white = |x: usize, y: usize| {
         // Upright (x, y) is framebuffer row x, column 479 - y, as BGRX.
@@ -2799,6 +2823,10 @@ mod shots {
         };
         let fonts = paint::Fonts::load(&fonts).unwrap();
         paint::set_theme(if std::env::var("UNFR0ZEN_UI_THEME").is_ok_and(|t| t == "nest") { paint::Theme::Nest } else { paint::Theme::Fledge });
+        // UNFR0ZEN_UI_SIDE=320: as the gen 2's panel shows them.
+        if let Some(side) = std::env::var("UNFR0ZEN_UI_SIDE").ok().and_then(|s| s.parse().ok()) {
+            paint::preview_at(side);
+        }
         let cards = Cards::parse(br#"{"cards":[
             {"kind":"lights","name":"Bedroom","icon":"mdi:lightbulb-group","lights":[
                 {"id":"light.reading_lamp","name":"Reading Lamp","icon":"m3s:table-lamp","on":true,"dimmable":true,"brightness":60,"rgb":[255,169,87]},
@@ -3078,13 +3106,13 @@ mod shots {
         save(&screens::draw(&fonts, &Screen::NestCard { nest: Cow::Borrowed(&warm), now }, None), &format!("{out}/n6-above-target.png"));
         save(&screens::draw(&fonts, &Screen::NestSet { nest: Cow::Borrowed(&warm), target: 22.5, pulse: None, setting: true, shown: Some((0.5, 22.0)) }, None),
              &format!("{out}/n7-fading.png"));
-        let mut zoomed = vec![0u8; (paint::SIZE * paint::SIZE * 4) as usize];
         let frames: Vec<device::Frame> = [Screen::NestCard { nest: Cow::Borrowed(&cold), now }, Screen::SettingsCard,
             Screen::ActionCard { card: &scene, done: false, opened: false }].iter().map(|screen| {
                 let mut frame = screens::draw(&fonts, screen, None).pixmap.data().to_vec();
                 zoom::round(&mut frame);
                 zoom::shrink(&frame)
             }).collect();
+        let mut zoomed = vec![0u8; frames[0].len()];
         zoom::compose(&mut zoomed, 1.0, zoom::zoomed(), zoom::zoomed(), |k| frames.get(k as usize).map(Vec::as_slice));
         let plain = zoomed.clone();
         zoom::focus(&mut zoomed, 1.0, zoom::zoomed(), None);
