@@ -13,7 +13,7 @@ nlclient `67596bb7…`, powered by USB only with no base (`--backplate-sim`).
 | MQTT and Home Assistant entities | works |
 | Fledge tile in the Nest's Settings | works |
 | Home screen cards: picture, orientation, ring, button | works |
-| Home screen cards: speed and stability | **not usable yet**: see Memory |
+| Home screen cards: speed and stability | usable: see Memory |
 
 ## What changed
 
@@ -26,10 +26,15 @@ nlclient `67596bb7…`, powered by USB only with no base (`--backplate-sim`).
   screen. It also starts the display keeper through NSPR's `PR_CreateThread`,
   because nlclient imports no `pthread_create`.
 - **Display** (`nestlocal/src/ui/device.rs`). The panel is 320x320 and not
-  mounted turned. Frames stay 480x480 for the UI: each one is scaled to 2/3
-  (3x3 to 2x2 weighted) and turned back a quarter on its way to the panel, and
-  read back scaled to 3/2. The UI draws on the page that's shown, not the
-  other one, because nlclient keeps drawing into its hidden page.
+  mounted turned. The UI draws natively at the panel's side: screens keep
+  their 480-unit layout, and a canvas scales units to pixels
+  (`paint::set_side`). Frames keep the gen 3's turned layout and are turned
+  back a quarter on their way to the panel. The UI draws on the page that's
+  shown, not the other one, because nlclient keeps drawing into its hidden
+  page.
+- **Text.** The gen 2's display is physically smaller too, so on it small
+  text is drawn up to a quarter larger (`paint::larger`), fading to none at
+  64 units; big numbers are as they are.
 - **Input.** The ring is `avago-adbs-a330` (REL_X, clockwise up) and the
   button is `twl4030_pwrbutton` (KEY_POWER). Both are mapped to REL_DIAL and
   KEY_ENTER, and written back as their own codes.
@@ -43,35 +48,32 @@ nlclient `67596bb7…`, powered by USB only with no base (`--backplate-sim`).
   its own (`fledge_keeper`) into the device bucket every 30 s, which makes
   nlclient commit.
 
-## Memory: the open problem
+## Memory and speed
 
-The gen 2 has 58 MB of RAM and no swap. Measured while turning the ring through
-the cards:
+The gen 2 has 58 MB of RAM and no swap. Drawing at 480 and scaling, nestlocal
+grew from 8 to 22 MB while turning through the cards. nlclient's code pages
+were evicted and re-read from the compressed JFFS2, it missed 8 heartbeats,
+and nlheartbeatd restarted the unit.
 
-| | Idle | Using the cards |
+Drawing natively at 320 more than halves every kept frame (410 KB rather than
+921 KB) and removes the scaling pass. Measured on the unit:
+
+| | 480, scaled | 320, native |
 |-|-|-|
-| nestlocal RSS | 14.5 MB | 22–23 MB |
-| Page cache | 21.6 MB | 11.6 MB |
-| nlclient RSS | 14.6 MB | 12.0 MB |
-| Major page faults | 719 | 1016 |
+| nestlocal RSS at start | 8 MB | 6–7 MB |
+| nestlocal RSS using the cards | 22–23 MB | 12–14 MB |
+| A typical frame | 21–115 ms | about 14 ms (copy 5.5) |
+| Uptime while using the cards | reboots within minutes | 3 h+, no reboot |
 
-nlclient's code pages get evicted and re-read from the compressed JFFS2. It
-stalls, misses 8 heartbeats, and nlheartbeatd restarts the unit.
-
-Showing the cards full size only (no zoomed-out chooser, no shrunk cards)
-lowered the CPU load (frames of 21–115 ms, 10–19 a second), but nestlocal
-still grows from 8 to 22 MB. The UI keeps many full frames, at 900 KB each:
-the dial saved every 3 s, the dial's other colour (`stills`), list layers,
-the recolour frame, nlclient's saved frame, home, each card, `scratch` and
-`shown`. Reads of the display also allocate temporaries.
-
-Next steps:
-1. Render at 320 natively instead of 480 then scaling. Every one of those
-   frames drops to 410 KB, and the scaling pass goes away.
-2. Until then, make `Display::put` faster: on the gen 2 most of a frame's time
-   is `copy`. That's the 2/3 scale and quarter turn, which reads the frame
-   column-wise. Tiles, or a cached scratch page copied out in rows, would help.
-3. Leave out what isn't used (Matter, Zigbee) to make nestlocal smaller.
+What's left:
+- The thermostat card's colour change (heating to idle) showed single frames
+  of 0.5–1.1 s, likely nlclient drawing its own fade unseen at the same time.
+  With *Act as a thermostat* off (a panel only, as on this unit) that screen
+  is gone.
+- nlclient keeps drawing unseen while the UI owns the screen, paced by the
+  16.7 ms sleep in `custom_present`. A longer sleep there would leave more
+  CPU to the UI.
+- Matter and Zigbee could be left out to make nestlocal smaller.
 
 ## Working on a unit
 
