@@ -252,6 +252,13 @@ fn fledge_theme(kept: Option<&str>) -> bool {
     kept.is_none_or(|kept| kept.trim() != "nest")
 }
 
+/// Whether the cards only ever show full size, sliding side by side: the
+/// gen 2's 58 MB can't keep each zoomed out too (a frame is 900 KB), nor its
+/// core compose them as the ring turns.
+fn full_size_only() -> bool {
+    crate::device::current().generation == 2
+}
+
 /// Starts the UI: it waits for cards from Home Assistant.
 pub fn start(ui: Arc<Ui>, sender: Arc<dyn Sender>) {
     let handle = tokio::runtime::Handle::try_current().ok();
@@ -988,7 +995,7 @@ impl Runtime {
                     self.prepare_key(index);
                     // Shown, if the cards are: it may be one of those showing.
                     self.force_draw |= self.view.is_some();
-                } else if let Some(&index) = keys.iter().find(|i| !self.shrunk.contains_key(i) && self.cards.contains_key(i)) {
+                } else if let Some(&index) = keys.iter().find(|i| !full_size_only() && !self.shrunk.contains_key(i) && self.cards.contains_key(i)) {
                     let shrunk = prof::time(prof::Part::Shrink, || zoom::shrink(&self.cards[&index]));
                     self.shrunk.insert(index, shrunk);
                 }
@@ -1211,6 +1218,9 @@ impl Runtime {
     /// Zoomed out on the cards, the chooser; full size settling back onto
     /// the thermostat, or opening a card (zoom_in).
     fn zoom_target(&self) -> f32 {
+        if full_size_only() {
+            return 1.0;
+        }
         match self.machine.mode {
             Mode::Chooser(_) => zoom::zoomed(),
             Mode::Home if self.machine.owns() => zoom::zoomed(),
