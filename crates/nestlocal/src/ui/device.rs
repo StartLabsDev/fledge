@@ -11,6 +11,13 @@
 //! "gpio-keys"). Grabbed (EVIOCGRAB), only this process reads them. Events
 //! written to a node go to its readers, or only to the grabber while it is
 //! grabbed: `nudge` lets go for the length of one write to reach nlclient.
+//!
+//! The gen 2: its display is 320x320 (two pages of 320x640), each frame
+//! scaled by 2/3 on its way to the panel and by 3/2 read back, so the UI
+//! draws at 480 as on the gen 3. Its ring is an optical sensor ("avago-adbs-
+//! a330", REL_X, clockwise up, about 4000 counts a turn) and its button the
+//! power button ("twl4030_pwrbutton", KEY_POWER): read as REL_DIAL and
+//! KEY_ENTER, and written back to nlclient as its own.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -23,8 +30,7 @@ use super::prof;
 pub const OWNER: &str = "/var/run/unfr0zen/screen.owner";
 const REST: &str = "/var/run/unfr0zen/screen.rest";
 const KEEPER_RESTS: &str = "/var/run/unfr0zen/keeper.rests";
-const RING: &str = "2280000.adc";
-const BUTTON: &str = "gpio-keys";
+const KEEPER: &str = "/var/run/unfr0zen/keeper.pid";
 const BEEPER: &str = "pwm-beeper";
 const EV_SND: u16 = 0x12;
 const SND_TONE: u16 = 2;
@@ -32,6 +38,23 @@ pub const EV_KEY: u16 = 1;
 pub const EV_REL: u16 = 2;
 pub const KEY_ENTER: u16 = 28;
 pub const REL_DIAL: u16 = 7;
+const REL_X: u16 = 0;
+const KEY_POWER: u16 = 116;
+
+/// A generation's ring and button: their input devices, and the codes they
+/// report. `ring_sign` turns its counts to the gen 3's (anticlockwise up).
+struct Controls {
+    ring: &'static str,
+    ring_code: u16,
+    ring_sign: i32,
+    button: &'static str,
+    button_code: u16,
+}
+
+const CONTROLS: [Controls; 2] = [
+    Controls { ring: "2280000.adc", ring_code: REL_DIAL, ring_sign: 1, button: "gpio-keys", button_code: KEY_ENTER },
+    Controls { ring: "avago-adbs-a330", ring_code: REL_X, ring_sign: 1, button: "twl4030_pwrbutton", button_code: KEY_POWER },
+];
 const EVIOCGRAB: libc::c_ulong = 0x4004_4590;
 
 pub fn own(yes: bool) {
@@ -60,7 +83,13 @@ pub fn beat(beat: u32) {
 /// when both want its one core: a frame late shows as a stutter, and what
 /// it holds up meanwhile (MQTT, nlclient's own housekeeping) is in no hurry.
 /// It sleeps between frames and while nothing moves.
+///
+/// Not on the gen 2, whose frames take most of its slower core: nlclient
+/// held up there misses its heartbeats, and nlheartbeatd restarts the unit.
 pub fn favour() {
+    if crate::device::current().generation == 2 {
+        return;
+    }
     // SAFETY: setpriority on the calling thread (0), which Linux takes a
     // nice value for apart from the process's other threads.
     #[cfg(target_os = "linux")]
@@ -89,6 +118,14 @@ pub fn rest(yes: bool) {
     if let Err(e) = result {
         crate::logf!("ui: {REST}: {e}");
     }
+}
+
+/// Whether the patch's display keeper runs in the nlclient running now: it
+/// starts at nlclient's first bucket commit, which on the gen 2 can be long
+/// in coming (Sender::nudge_nlclient).
+pub fn keeper_runs() -> bool {
+    let Ok(pid) = std::fs::read_to_string(KEEPER) else { return false };
+    std::fs::read_to_string(format!("/proc/{}/comm", pid.trim())).is_ok_and(|comm| comm.trim() == "nlclient")
 }
 
 /// Asks nlclient to light its display (custom_screen.c's keeper).
@@ -161,6 +198,8 @@ pub struct Display {
     map: *mut u8,
     len: usize,
     stride: usize,
+    /// The panel's side: SIDE, or SMALL (the gen 2).
+    side: usize,
     /// While the UI owns the display, it draws into the page that isn't
     /// shown and then pans to it, so no frame shows half drawn.
     flip: Option<Flip>,
@@ -204,6 +243,10 @@ impl Display {
         let stride: usize = sys("stride")?.parse().map_err(|_| "fb0: stride".to_string())?;
         let size = sys("virtual_size")?;
         let rows: usize = size.split(',').nth(1).and_then(|s| s.parse().ok()).ok_or("fb0: virtual_size")?;
+        let side: usize = size.split(',').next().and_then(|s| s.parse().ok()).ok_or("fb0: virtual_size")?;
+        if side != SIDE && side != SMALL {
+            return Err(format!("fb0: a {side} pixel display"));
+        }
         let file = std::fs::OpenOptions::new().read(true).write(true).open("/dev/fb0")
             .map_err(|e| format!("/dev/fb0: {e}"))?;
         let len = stride * rows;
@@ -215,7 +258,49 @@ impl Display {
         if map == libc::MAP_FAILED {
             return Err(format!("/dev/fb0: mmap: {}", std::io::Error::last_os_error()));
         }
-        Ok(Display { file, map: map.cast(), len, stride, flip: None, shown: vec![0; SIDE * ROW] })
+        Ok(Display { file, map: map.cast(), len, stride, side, flip: None, shown: vec![0; SIDE * ROW] })
+    }
+
+    /// Writes the frame's rows `first` to `last` into a page: as they are,
+    /// or on the gen 2 the panel's columns they make, scaled by 2/3 and
+    /// turned back a quarter, its panel showing the framebuffer unturned.
+    fn put(page: &mut [u8], stride: usize, side: usize, frame: &[u8], first: usize, last: usize) {
+        if side == SIDE {
+            for y in first..=last.min(SIDE - 1) {
+                page[y * stride..y * stride + ROW].copy_from_slice(&frame[y * ROW..(y + 1) * ROW]);
+            }
+            return;
+        }
+        let (from, to) = (first * 2 / 3, (last * 2 / 3 + 1).min(SMALL - 1));
+        let mut line = [0u8; SMALL * 4];
+        for y in 0..SMALL {
+            panel_row(frame, y, from, to, &mut line);
+            page[y * stride + from * 4..y * stride + (to + 1) * 4].copy_from_slice(&line[from * 4..(to + 1) * 4]);
+        }
+    }
+
+    /// A page as a Frame: the gen 2's scaled by 3/2 and turned a quarter,
+    /// from a copy read in whole rows (its memory is slow a pixel at a time).
+    fn take(page: &[u8], stride: usize, side: usize) -> Frame {
+        let mut frame = Vec::with_capacity(SIDE * ROW);
+        if side == SIDE {
+            for y in 0..SIDE {
+                frame.extend_from_slice(&page[y * stride..y * stride + ROW]);
+            }
+            return frame;
+        }
+        let mut panel = vec![0u8; SMALL * SMALL * 4];
+        for y in 0..SMALL {
+            panel[y * SMALL * 4..(y + 1) * SMALL * 4].copy_from_slice(&page[y * stride..y * stride + SMALL * 4]);
+        }
+        for y in 0..SIDE {
+            let column = y * 2 / 3 * 4;
+            for x in 0..SIDE {
+                let at = (SIDE - 1 - x) * 2 / 3 * SMALL * 4 + column;
+                frame.extend_from_slice(&panel[at..at + 4]);
+            }
+        }
+        frame
     }
 
     /// The panning offset's row: the page shown.
@@ -227,7 +312,7 @@ impl Display {
     fn page(&self) -> usize {
         match &self.flip {
             Some(flip) => flip.pages[flip.front] * self.stride,
-            None => (self.pan() * self.stride).min(self.len.saturating_sub(self.stride * 480)),
+            None => (self.pan() * self.stride).min(self.len.saturating_sub(self.stride * self.side)),
         }
     }
 
@@ -260,11 +345,14 @@ impl Display {
     /// flipped to. Without two pages it draws straight on the shown one.
     pub fn begin(&mut self) {
         let rows = self.len / self.stride;
-        if rows < 2 * SIDE {
+        if rows < 2 * self.side {
             return;
         }
-        let pages = [0, rows / 2];
-        let home = usize::from(self.pan() >= rows / 2);
+        // The gen 2's nlclient goes on drawing into the page it doesn't
+        // show (its present is skipped, not its drawing): the UI keeps to the
+        // one shown, drawing straight on it.
+        let pages = if self.side == SIDE { [0, rows / 2] } else { [self.pan(); 2] };
+        let home = usize::from(self.side == SIDE && self.pan() >= rows / 2);
         self.flip = Some(Flip { pages, front: home, home, stale: [Some((0, SIDE - 1)); 2] });
     }
 
@@ -273,11 +361,8 @@ impl Display {
     pub fn end(&mut self, frame: &[u8]) {
         let Some(flip) = self.flip.take() else { return self.show(frame) };
         let start = flip.pages[flip.home] * self.stride;
-        let stride = self.stride;
-        let page = &mut self.bytes()[start..];
-        for y in 0..SIDE {
-            page[y * stride..y * stride + ROW].copy_from_slice(&frame[y * ROW..(y + 1) * ROW]);
-        }
+        let (stride, side) = (self.stride, self.side);
+        Self::put(&mut self.bytes()[start..], stride, side, frame, 0, SIDE - 1);
         if let Err(e) = self.pan_to(flip.pages[flip.home]) {
             crate::logf!("ui: pan: {e}");
         }
@@ -286,10 +371,18 @@ impl Display {
     /// Writes rows into the page to show next and flips to it: `rows`
     /// those changed (None, all), each given by `each`.
     fn present(&mut self, rows: Option<(usize, usize)>, mut each: impl FnMut(usize, &mut [u8])) {
-        let stride = self.stride;
+        let (stride, side) = (self.stride, self.side);
         let Some(flip) = self.flip.as_mut() else {
             let start = self.page();
             let (first, last) = rows.unwrap_or((0, SIDE - 1));
+            if side != SIDE {
+                for y in first..=last.min(SIDE - 1) {
+                    each(y, &mut self.shown[y * ROW..(y + 1) * ROW]);
+                }
+                // SAFETY: map is len bytes, mapped for this Display's life; shown is a separate field.
+                let page = unsafe { std::slice::from_raw_parts_mut(self.map.add(start), self.len - start) };
+                return Self::put(page, stride, side, &self.shown, first, last);
+            }
             let page = &mut self.bytes()[start..];
             for y in first..=last.min(SIDE - 1) {
                 each(y, &mut page[y * stride..y * stride + ROW]);
@@ -312,13 +405,22 @@ impl Display {
             for row in first..=last.min(SIDE - 1) {
                 let line = &mut shown[row * ROW..(row + 1) * ROW];
                 each(row, line);
-                page[row * stride..row * stride + ROW].copy_from_slice(line);
+                if side == SIDE {
+                    page[row * stride..row * stride + ROW].copy_from_slice(line);
+                }
+            }
+            if side != SIDE {
+                Self::put(page, stride, side, shown, first, last);
             }
         });
         // For tools (utils/nest-screen.py): the frame about to show, whole,
         // where reading the framebuffer could catch the next one being drawn.
         if std::fs::remove_file(CAPTURE_REQUEST).is_ok() {
-            let frame: Vec<u8> = (0..SIDE).flat_map(|row| page[row * stride..row * stride + ROW].to_vec()).collect();
+            let frame = if side == SIDE {
+                (0..SIDE).flat_map(|row| page[row * stride..row * stride + ROW].to_vec()).collect()
+            } else {
+                shown.clone()
+            };
             let _ = crate::settings_ui::publish("capture.raw", &frame);
         }
         if let Err(e) = prof::time(prof::Part::Pan, || self.pan_to(y)) {
@@ -333,15 +435,9 @@ impl Display {
 
     /// The visible page's top 480 rows as a Frame: what nlclient shows.
     pub fn save(&mut self) -> Frame {
-        let (start, stride) = (self.page(), self.stride);
+        let (start, stride, side) = (self.page(), self.stride, self.side);
         let page = &self.bytes()[start..];
-        let mut frame = Vec::with_capacity(SIDE * ROW);
-        prof::time(prof::Part::Read, || {
-            for y in 0..SIDE {
-                frame.extend_from_slice(&page[y * stride..y * stride + ROW]);
-            }
-        });
-        frame
+        prof::time(prof::Part::Read, || Self::take(page, stride, side))
     }
 
     /// What shows: the UI's own last frame while it has the display (and
@@ -399,6 +495,30 @@ impl Display {
 /// The display's side, and a framebuffer row of it in bytes.
 const SIDE: usize = 480;
 const ROW: usize = SIDE * 4;
+/// The gen 2's display side: 2/3 of SIDE.
+const SMALL: usize = 320;
+
+/// Of the three frame rows or columns a gen 2 pixel's two come from, the
+/// nearer and the middle one.
+fn thirds(at: usize) -> (usize, usize) {
+    (3 * (at / 2) + at % 2 * 2, 3 * (at / 2) + 1)
+}
+
+/// The gen 2 panel's row `y`, pixels `from` to `to`, from a Frame: the Frame
+/// turned back a quarter (the panel's row y is its column SMALL - 1 - y),
+/// each 3x3 pixels to 2x2, weighted 2:1 towards the nearer of the three.
+fn panel_row(frame: &[u8], y: usize, from: usize, to: usize, out: &mut [u8; SMALL * 4]) {
+    let (cn, cf) = thirds(SMALL - 1 - y);
+    let (cn, cf) = (cn * 4, cf * 4);
+    for x in from..=to {
+        let (rn, rf) = thirds(x);
+        let (a, b) = (&frame[rn * ROW..(rn + 1) * ROW], &frame[rf * ROW..(rf + 1) * ROW]);
+        for c in 0..4 {
+            let v = 4 * a[cn + c] as u32 + 2 * (a[cf + c] as u32 + b[cn + c] as u32) + b[cf + c] as u32;
+            out[x * 4 + c] = (v / 9) as u8;
+        }
+    }
+}
 
 /// A screen as the framebuffer holds it: 480 rows of 480 BGRX pixels, the
 /// picture turned a quarter anticlockwise, as the panel shows the
@@ -427,6 +547,7 @@ pub struct Input {
     ring: File,
     button: File,
     grabbed: bool,
+    controls: &'static Controls,
 }
 
 fn node(name: &str) -> Result<File, String> {
@@ -467,7 +588,14 @@ fn encode(kind: u16, code: u16, value: i32) -> [u8; 16] {
 
 impl Input {
     pub fn open() -> Result<Input, String> {
-        Ok(Input { ring: node(RING)?, button: node(BUTTON)?, grabbed: false })
+        let mut missing = Vec::new();
+        for controls in &CONTROLS {
+            match (node(controls.ring), node(controls.button)) {
+                (Ok(ring), Ok(button)) => return Ok(Input { ring, button, grabbed: false, controls }),
+                (Err(e), _) | (_, Err(e)) => missing.push(e),
+            }
+        }
+        Err(missing.join(", "))
     }
 
     pub fn grab(&mut self, yes: bool) {
@@ -501,8 +629,14 @@ impl Input {
                     let kind = u16::from_ne_bytes([raw[8], raw[9]]);
                     let code = u16::from_ne_bytes([raw[10], raw[11]]);
                     let value = i32::from_ne_bytes([raw[12], raw[13], raw[14], raw[15]]);
-                    if kind == EV_REL || kind == EV_KEY {
-                        events.push(Event { kind, code, value });
+                    let c = self.controls;
+                    match (kind, code) {
+                        (EV_REL, code) if code == c.ring_code => {
+                            events.push(Event { kind, code: REL_DIAL, value: value * c.ring_sign });
+                        }
+                        (EV_KEY, code) if code == c.button_code => events.push(Event { kind, code: KEY_ENTER, value }),
+                        (EV_REL | EV_KEY, _) => events.push(Event { kind, code, value }),
+                        _ => {}
                     }
                 }
             }
@@ -513,7 +647,8 @@ impl Input {
     /// A turn of the ring for nlclient, as a hand makes one: `reports`
     /// reports of `raw` counts, 25 ms apart (its menus take no other).
     pub fn hand_turn(&mut self, raw: i32, reports: usize) {
-        let report: Vec<u8> = [encode(EV_REL, REL_DIAL, raw), encode(0, 0, 0)].concat();
+        let c = self.controls;
+        let report: Vec<u8> = [encode(EV_REL, c.ring_code, raw * c.ring_sign), encode(0, 0, 0)].concat();
         for _ in 0..reports {
             self.send(true, &report);
             std::thread::sleep(Duration::from_millis(25));
@@ -522,8 +657,9 @@ impl Input {
 
     /// A press and release of the button, for nlclient.
     pub fn press(&mut self) {
-        let down: Vec<u8> = [encode(EV_KEY, KEY_ENTER, 1), encode(0, 0, 0)].concat();
-        let up: Vec<u8> = [encode(EV_KEY, KEY_ENTER, 0), encode(0, 0, 0)].concat();
+        let key = self.controls.button_code;
+        let down: Vec<u8> = [encode(EV_KEY, key, 1), encode(0, 0, 0)].concat();
+        let up: Vec<u8> = [encode(EV_KEY, key, 0), encode(0, 0, 0)].concat();
         self.send(false, &down);
         std::thread::sleep(Duration::from_millis(120));
         self.send(false, &up);
@@ -540,5 +676,40 @@ impl Input {
         let mut discard = [0u8; 16 * 8];
         while matches!(file.read(&mut discard), Ok(n) if n > 0) {}
         self.grab(was);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_gen_2_panel_shows_a_frame_at_two_thirds() {
+        // A frame of 3x3 blocks, each one value: each comes out a 2x2 block.
+        let mut frame = vec![0u8; SIDE * ROW];
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                let v = ((x / 3 + y / 3) % 2 * 200) as u8;
+                frame[y * ROW + x * 4..y * ROW + x * 4 + 4].copy_from_slice(&[v, v, v, 0]);
+            }
+        }
+        let mut line = [0u8; SMALL * 4];
+        for y in 0..SMALL {
+            panel_row(&frame, y, 0, SMALL - 1, &mut line);
+            for x in 0..SMALL {
+                // Turned back a quarter: the panel's (x, y) is the frame's (319 - y, x).
+                let want = (((SMALL - 1 - y) / 2 + x / 2) % 2 * 200) as u8;
+                assert_eq!(line[x * 4..x * 4 + 4], [want, want, want, 0], "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_gen_2_page_reads_back_at_480() {
+        let mut page = vec![0u8; SMALL * SMALL * 4];
+        page[(10 * SMALL + 20) * 4] = 9;
+        let frame = Display::take(&page, SMALL * 4, SMALL);
+        assert_eq!(frame.len(), SIDE * ROW);
+        assert_eq!(frame[(30 * SIDE + 464) * 4], 9);
     }
 }

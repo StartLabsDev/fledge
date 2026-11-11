@@ -236,6 +236,9 @@ pub trait Sender: Send + Sync + 'static {
     }
     /// One of this thermostat's own commands, as <base>/set/<name> takes it.
     fn nest_command(&self, _name: &str, _arg: &str) {}
+    /// Has nlclient commit its device bucket (a field of Fledge's own in
+    /// it changed), which starts the patch's display keeper in it.
+    fn nudge_nlclient(&self) {}
 }
 
 /// Kept while the thermostat shows Nest's own dial rather than its card.
@@ -249,7 +252,7 @@ fn fledge_theme(kept: Option<&str>) -> bool {
     kept.is_none_or(|kept| kept.trim() != "nest")
 }
 
-/// Starts the UI on a gen 3 unit: it waits for cards from Home Assistant.
+/// Starts the UI: it waits for cards from Home Assistant.
 pub fn start(ui: Arc<Ui>, sender: Arc<dyn Sender>) {
     let handle = tokio::runtime::Handle::try_current().ok();
     let spawned = std::thread::Builder::new().name("ui".into()).spawn(move || {
@@ -350,6 +353,8 @@ struct Runtime {
     ticker: Option<Ticker>,
     last_frame: Instant,
     last_check: Instant,
+    /// When nlclient was last nudged to start the patch's display keeper.
+    last_nudge: Option<Instant>,
     nlclient: bool,
     /// When the button went down, whether its hold was taken as a long
     /// press, and whether the display was lit then.
@@ -563,7 +568,7 @@ impl Runtime {
             seen: (SEEN_FAR.load(std::sync::atomic::Ordering::Relaxed), SEEN_NEAR.load(std::sync::atomic::Ordering::Relaxed)),
             rest: false, black: false, beat: 0, last_beat: now,
             scratch: vec![0; (paint::SIZE * paint::SIZE * 4) as usize], sweep: None, live: None, ticker: None, last_frame: now,
-            last_check: now - Duration::from_secs(10), nlclient: false, frames: Default::default(), spent: Default::default(), paced: Default::default(),
+            last_check: now - Duration::from_secs(10), last_nudge: None, nlclient: false, frames: Default::default(), spent: Default::default(), paced: Default::default(),
             pressed: None, back_chosen: None, back_since: None, native_input: now, settings_checked: now, settings_seen: 0, native_settings: false,
             nest_checked: now - Duration::from_secs(10), pulse: None, next_pulse: now, glide: None, force_draw: false, last_click: now, cards_stale: false, home_from: None, set_words: false, volume_view: false, progress_drawn: now, fade_next: false,
             recolour: None, stills: HashMap::new(), now_shown: (0.0, 0.0), now_side: 1.0,
@@ -602,6 +607,14 @@ impl Runtime {
             if now.duration_since(self.last_check) >= Duration::from_secs(2) && !self.moving() {
                 self.last_check = now;
                 self.nlclient = !crate::pids("nlclient").is_empty();
+                // Without its keeper, nlclient never lights the display for
+                // the UI: have it commit, which starts it, every 30 s until.
+                if self.nlclient && !device::keeper_runs()
+                    && self.last_nudge.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(30)) {
+                    self.last_nudge = Some(now);
+                    logf!("ui: nlclient's display keeper isn't running: nudging nlclient");
+                    self.sender.nudge_nlclient();
+                }
                 let rests = device::rests();
                 if rests != self.machine.rests {
                     logf!("ui: {}", if rests { "holds the display at rest" } else { "hands the display back at rest" });
@@ -926,6 +939,11 @@ impl Runtime {
                         *sum += part;
                     }
                     self.frames = (self.frames.0 + 1, self.frames.1 + took, self.frames.2.max(took));
+                    // The gen 2 leaves its core to the rest at least as long
+                    // as a frame took (device::favour).
+                    if crate::device::current().generation == 2 {
+                        std::thread::sleep(took);
+                    }
                     let shown = Instant::now();
                     if let Some(gap) = self.paced.0.map(|last| shown.duration_since(last)).filter(|gap| *gap < LULL) {
                         let late = (gap > LATE) as u32;

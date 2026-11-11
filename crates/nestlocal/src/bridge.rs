@@ -1195,6 +1195,11 @@ impl crate::ui::Sender for Bridge {
     fn nest_command(&self, name: &str, arg: &str) {
         self.command(&format!("{}/set/{name}", self.base), arg.as_bytes());
     }
+
+    fn nudge_nlclient(&self) {
+        let now = chrono::Utc::now().timestamp_millis();
+        self.store.merge(&format!("device.{}", self.serial), &fields!{"fledge_keeper" => now}, 0, 0, false);
+    }
 }
 
 #[cfg(test)]

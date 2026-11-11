@@ -280,7 +280,7 @@ async fn run(config: flags::Config) {
     if config.doom {
         doom::start();
     }
-    if let (Some(bridge), true) = (&bridge, device::current().display == 480) {
+    if let Some(bridge) = &bridge {
         ui::start(bridge.ui.clone(), bridge.clone());
     }
     if let (true, Some(bridge)) = (config.zigbee, &bridge) {

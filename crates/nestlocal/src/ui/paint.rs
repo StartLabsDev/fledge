@@ -45,7 +45,8 @@ impl Fonts {
         let built_in = |data: &'static [u8]| FontArc::try_from_slice(data).map_err(|e| format!("a built-in font: {e}"));
         Ok(Fonts {
             nest_regular: load("AkkuratNest-Regular.ttf")?,
-            nest_medium: load("AkkuratNest-Medium.ttf")?,
+            // The gen 2 has the Nest's bold in its place.
+            nest_medium: load("AkkuratNest-Medium.ttf").or_else(|_| load("AkkuratNest-Bold.ttf"))?,
             fledge_regular: built_in(include_bytes!("fonts/DMSans-Regular.ttf"))?,
             fledge_medium: built_in(include_bytes!("fonts/DMSans-Medium.ttf"))?,
             fledge_digits: built_in(include_bytes!("fonts/Outfit-ExtraLight.ttf"))?,
