@@ -403,6 +403,8 @@ fn unsupported_relocations_and_branch_veneers_are_refused() {
                  "native_pthread_create", "native_usleep", "native_getpid"] {
         externals.entry(name.into()).or_insert(stub);
     }
+    externals.entry("native_fb_present".into()).or_insert(0);
+    externals.entry("native_pr_create_thread".into()).or_insert(0);
     let layout: BTreeMap<String, u32> =
         serde_json::from_value(golden["discovery"]["layout"].clone()).unwrap();
     externals.extend(layout.into_iter().map(|(k, v)| (format!("layout_{k}"), v)));

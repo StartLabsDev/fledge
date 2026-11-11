@@ -322,6 +322,20 @@ u32 custom_swap(void *display, void *surface) {
     if (screen_owned()) return 1; /* EGL_TRUE: drawn, not shown */
     return native_egl_swap(display, surface);
 }
+/* The gen 2 has no EGL: nlclient draws into /dev/fb0's two pages itself and
+ * shows each frame through one method that flips its page and pans to the
+ * drawn one (FBIOPAN_DISPLAY), then waits for vsync. Skipped whole, nlclient
+ * keeps drawing into the hidden page; the sleep stands in for the vsync wait
+ * so its frames stay paced. */
+extern int native_fb_present(void *, void *);
+extern int native_usleep(unsigned int);
+int custom_present(void *fb, void *pages) {
+    if (screen_owned()) {
+        native_usleep(16667);
+        return 0;
+    }
+    return native_fb_present(fb, pages);
+}
 /* While the UI owns the display, nlclient sees none of the ring and button,
  * so it would let its display go dark. A thread of nlclient's own lights it
  * as a command from Home Assistant does (wake_display): every 2 s while the
@@ -334,7 +348,11 @@ u32 custom_swap(void *display, void *surface) {
  * STALE_TICKS of the thread running (time awake: suspended, neither runs);
  * a hung owner's file is moved aside, so nlclient presents again. KEEPER_RESTS
  * tells the UI this build knows both. */
-extern int native_pthread_create(void *, void *, void *(*)(void *), void *);
+/* nlclient imports one of the two thread starts; the other links as 0. */
+extern int native_pthread_create(void *, void *, void *(*)(void *), void *) __attribute__((visibility("hidden")));
+/* NSPR's PR_CreateThread(type, start, arg, priority, scope, state, stack). */
+extern void *native_pr_create_thread(unsigned int, void (*)(void *), void *, unsigned int,
+                                     unsigned int, unsigned int, unsigned int);
 extern int native_usleep(unsigned int);
 extern int native_getpid(void);
 #define DISPLAY_WAKE "/var/run/unfr0zen/display.wake"
@@ -366,6 +384,9 @@ static void *keeper(void *globals) {
         if (wake || (ticks % 20 == 0 && screen_owned() && !exists(SCREEN_REST))) wake_display(globals);
     }
     return 0;
+}
+static void keeper_nspr(void *globals) {
+    keeper(globals);
 }
 /* The owner's pid, and its heartbeat after a space (-1 without one). */
 static int read_owner(int *beat) {
@@ -410,7 +431,13 @@ static void keeper_start(void *bucket) {
     void *rests = native_fopen(KEEPER_RESTS, "w");
     if (rests) native_fclose(rests);
     unsigned int thread;
-    native_pthread_create(&thread, 0, keeper, PTR(bucket, BUCKET_GLOBALS_OFFSET));
+    /* Opaque to the compiler, which takes a linked function for nonzero. */
+    void *pthread_create = (void *)native_pthread_create;
+    __asm__("" : "+r"(pthread_create));
+    if (pthread_create)
+        native_pthread_create(&thread, 0, keeper, PTR(bucket, BUCKET_GLOBALS_OFFSET));
+    else /* a user thread, normal priority, global scope, unjoinable */
+        native_pr_create_thread(0, keeper_nspr, PTR(bucket, BUCKET_GLOBALS_OFFSET), 1, 1, 1, 0);
 }
 /* What nlclient shows, as nlclient itself tells it. Every change of its
  * screen, view or a screen's active layer goes through one telemetry report
