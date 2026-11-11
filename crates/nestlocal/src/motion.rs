@@ -9,6 +9,10 @@
 //!   about once a second while someone is close, N growing as they come
 //!   nearer (nlclient's wake on approach). Not "tp crossings": those come
 //!   with any movement, near or far.
+//! - "publishing near pir msg N": the gen2's near PIR in place of the
+//!   thermopile, from its backplate's MSG_NEAR_PIR; N other than 0 is someone
+//!   close. Without its base (backplate simulator) the gen2 reads none of
+//!   these sensors: they come from the backplate's microcontroller.
 //! - "pir N; px1 ..; alv A, alir I": a reading every few seconds while
 //!   awake, with the ambient light sensor's visible (A) and infrared (I).
 //! - "msg: *HVAC power [init]  vusb U vin I vout O" and "state .., vi IV, vo
@@ -138,6 +142,8 @@ pub fn reading(line: &str) -> Option<Event> {
     let (_, said) = line.split_once("backplate controller: ")?;
     if said.starts_with("publishing pir msg true") {
         Some(Event::Sensed(Sensor::Motion))
+    } else if let Some(near) = said.strip_prefix("publishing near pir msg ") {
+        (number(near, "")? != 0).then_some(Event::Sensed(Sensor::Near))
     } else if said.starts_with("publishing tp - ") {
         Some(Event::Approach(number(said, "maxud:")?))
     } else if said.starts_with("pir ") && said.contains("alv ") {
@@ -295,6 +301,14 @@ mod tests {
         assert_eq!(reading("2026-11-09 13:25:07.694777 S nlclient[16444:bckpla] (2) backplate controller: pir 8209; px1 65240/15, px2 65240/15; alv 12, alir 19"),
                    Some(Event::Light { visible: 12, infrared: 19 }));
         assert_eq!(event("czcomms: promoting hot water schedule"), None);
+    }
+
+    #[test]
+    fn the_gen2s_near_pir_is_someone_close() {
+        // Its format string in the gen2's nlclient 5.9.4: "publishing near pir msg %d, threshold %u".
+        let near = |n: u32| format!("2026-11-11 20:30:00.000000 02AA01AC4313051B nlclient[495:bckpla] (2) backplate controller: publishing near pir msg {n}, threshold 40");
+        assert_eq!(event(&near(1)), Some(Sensor::Near));
+        assert_eq!(event(&near(0)), None, "0 is no one close");
     }
 
     #[test]
