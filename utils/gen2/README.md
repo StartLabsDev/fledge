@@ -3,7 +3,8 @@
 This branch makes Fledge's patch and nestlocal's home screen cards run on a
 2nd generation Nest Learning Thermostat. It's based on v0.8.0 and has been
 tested on one unit: Display-2.8, AM3703, Micron MT29F2G16 NAND, stock
-nlclient `67596bb7…`, powered by USB only with no base (`--backplate-sim`).
+nlclient `67596bb7…`, first powered by USB only with no base
+(`--backplate-sim`), then on its base with 12 V on the terminals.
 
 ## Status
 
@@ -14,6 +15,7 @@ nlclient `67596bb7…`, powered by USB only with no base (`--backplate-sim`).
 | Fledge tile in the Nest's Settings | works |
 | Home screen cards: picture, orientation, ring, button | works |
 | Home screen cards: speed and stability | usable: see Memory |
+| Motion, someone close, light, external power | works on a base: see Sensors |
 
 ## What changed
 
@@ -47,6 +49,25 @@ nlclient `67596bb7…`, powered by USB only with no base (`--backplate-sim`).
   can take a long time on the gen 2. Until it runs, the UI merges a field of
   its own (`fledge_keeper`) into the device bucket every 30 s, which makes
   nlclient commit.
+
+- **Someone close** (`nestlocal/src/motion.rs`). The gen 2 has no
+  thermopile: its backplate reports a near PIR, which nlclient logs as
+  `publishing near pir msg N, threshold T`. That line is read as someone
+  close.
+
+## Sensors
+
+The PIR, near PIR and ambient light sensor are read by the backplate's
+microcontroller, not by the head: its kernel has no device for them. With
+`--backplate-sim` and no base, nlclient gets none of their messages and
+Motion, Someone close and the light sensors stay unknown; the simulator's
+temperature and humidity are made up.
+
+On its base (12 V on Rh and C, patched without `--backplate-sim`) nlclient
+logs the same `publishing pir msg` and `pir …; alv A, alir I` lines as the
+gen 3, and `state …, vi …V, vo …V` for the power, so Motion, Someone close,
+Light level, Infrared light and External power reach Home Assistant. The
+USB port is covered on the base: `--ssh` gives a shell over Wi-Fi.
 
 ## Memory and speed
 
