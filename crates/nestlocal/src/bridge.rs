@@ -61,9 +61,10 @@ const SENSOR_ENTITIES: [(&str, &str); 2] = [("sensor", "external_temperature"), 
 /// What stays announced while the Nest isn't a thermostat (role.rs): what
 /// it senses and what keeps it, besides the motion sensors; nothing that
 /// controls or reports heating.
-const PANEL_ENTITIES: [&str; 14] = ["wwn_boiler_option", "current_temperature", "current_humidity", "backplate_temperature", "battery_level",
+const PANEL_ENTITIES: [&str; 20] = ["wwn_boiler_option", "current_temperature", "current_humidity", "backplate_temperature", "battery_level",
     "rssi", "local_ip", "occupancy", "light_level", "infrared_light", "external_power", "backplate_input_voltage",
-    "temperature_scale", "act_as_thermostat"];
+    "temperature_scale", "act_as_thermostat",
+    "memory_used", "memory_left", "nest_page_faults", "memory_pressure", "cards_paused", "resume_cards"];
 
 /// Whether the entity `key` stays announced while the Nest isn't a thermostat.
 fn on_a_panel(key: &str) -> bool {
@@ -319,6 +320,16 @@ impl Bridge {
         }
         let payload = serde_json::json!({"visible": visible, "infrared": infrared}).to_string();
         self.publish(&format!("{}/light", self.base), true, payload.as_bytes());
+    }
+
+    /// The memory's reading from health.rs (the gen 2's), on <base>/memory.
+    fn publish_memory(&self, reading: &crate::health::Reading, faults: u64, level: crate::health::Level, paused: bool) {
+        let megabytes = |kb: u64| (kb as f64 / 102.4).round() / 10.0;
+        let payload = serde_json::json!({
+            "used": megabytes(reading.own_kb), "left": megabytes(reading.free_kb),
+            "faults": faults, "level": level.name(), "cards_paused": paused,
+        }).to_string();
+        self.publish(&format!("{}/memory", self.base), true, payload.as_bytes());
     }
 
     /// The backplate's power from motion.rs, on <base>/power (retained: the
@@ -733,6 +744,43 @@ impl Bridge {
                 "device_class" => "voltage",
                 "state_class" => "measurement",
                 "entity_category" => "diagnostic",
+            });
+        }
+
+        // The gen 2's memory (health.rs): what it has to spare is what its
+        // cards and nlclient share.
+        if crate::device::current().generation == 2 {
+            let memory = format!("{}/memory", self.base);
+            for (key, name, field, unit, icon) in [
+                ("memory_used", "Fledgeling memory", "used", "MB", "mdi:memory"),
+                ("memory_left", "Memory left", "left", "MB", "mdi:memory"),
+                ("nest_page_faults", "Nest page faults", "faults", "/s", "mdi:harddisk"),
+            ] {
+                add("sensor", key, name, fields!{
+                    "state_topic" => memory.clone(),
+                    "value_template" => format!("{{{{ value_json.{field} }}}}"),
+                    "unit_of_measurement" => unit,
+                    "state_class" => "measurement",
+                    "entity_category" => "diagnostic",
+                    "icon" => icon,
+                });
+            }
+            add("sensor", "memory_pressure", "Memory pressure", fields!{
+                "state_topic" => memory.clone(),
+                "value_template" => "{{ value_json.level }}",
+                "entity_category" => "diagnostic",
+                "icon" => "mdi:gauge",
+            });
+            add("binary_sensor", "cards_paused", "Cards paused", fields!{
+                "state_topic" => memory,
+                "value_template" => "{{ 'ON' if value_json.cards_paused else 'OFF' }}",
+                "device_class" => "problem",
+                "entity_category" => "diagnostic",
+            });
+            add("button", "resume_cards", "Resume cards", fields!{
+                "command_topic" => format!("{set}resume_cards"),
+                "entity_category" => "config",
+                "icon" => "mdi:play-circle-outline",
             });
         }
 
@@ -1154,6 +1202,12 @@ pub fn state(dev: &Fields, sh: &Fields) -> Fields {
 }
 
 /// The home screen cards' commands, to Home Assistant's nest_ui blueprint.
+impl crate::health::Report for Bridge {
+    fn memory(&self, reading: &crate::health::Reading, faults: u64, level: crate::health::Level, paused: bool) {
+        self.publish_memory(reading, faults, level, paused);
+    }
+}
+
 impl crate::ui::Sender for Bridge {
     fn send(&self, command: &crate::ui::Command) {
         let payload = command.payload().to_string();

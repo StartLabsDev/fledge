@@ -259,10 +259,35 @@ fn full_size_only() -> bool {
     crate::device::current().generation == 2
 }
 
+/// How many cards' frames are kept at once, where each must be counted: on
+/// the gen 2, fewer as its memory gets tight (health.rs). A turn from one
+/// card to the next needs two.
+fn frame_budget() -> usize {
+    if !full_size_only() {
+        return usize::MAX;
+    }
+    match crate::health::level() {
+        crate::health::Level::Calm => 6,
+        crate::health::Level::Tight => 3,
+        crate::health::Level::Critical => 2,
+    }
+}
+
+/// The keys in `recent` to forget, oldest first, for `kept` frames to fit
+/// `budget`: never `keep`, the one just drawn.
+fn over_budget(recent: &[usize], kept: usize, budget: usize, keep: usize) -> Vec<usize> {
+    recent.iter().copied().filter(|&key| key != keep).take(kept.saturating_sub(budget)).collect()
+}
+
 /// Starts the UI: it waits for cards from Home Assistant.
 pub fn start(ui: Arc<Ui>, sender: Arc<dyn Sender>) {
     let handle = tokio::runtime::Handle::try_current().ok();
     let spawned = std::thread::Builder::new().name("ui".into()).spawn(move || {
+        // Paused (the unit kept restarting with them): nothing of the cards
+        // is loaded or opened until Home Assistant resumes them.
+        while crate::health::cards_paused() {
+            std::thread::sleep(Duration::from_secs(5));
+        }
         let fonts = match paint::Fonts::load(paint::FONT_DIR) {
             Ok(fonts) => fonts,
             Err(e) => return logf!("ui: {e}: no home screen cards"),
@@ -312,6 +337,11 @@ struct Runtime {
     /// and zoomed out (zoom::shrink; the thermostat's under 0).
     cards: std::collections::HashMap<usize, device::Frame>,
     shrunk: std::collections::HashMap<usize, device::Frame>,
+    /// The cards' keys as their frames were last asked for, oldest first:
+    /// what goes first where only so many are kept (frame_budget).
+    recent: Vec<usize>,
+    /// The memory's level the frames kept were last fitted to.
+    pressure: crate::health::Level,
     /// What each card's frame was drawn from, and the cards whose frames
     /// are out of date: kept showing while the cards move (drawing one
     /// takes several frames' time), drawn again once they rest.
@@ -570,7 +600,7 @@ impl Runtime {
         Runtime {
             ui, sender, fonts, display, input, beeper: device::Beeper::open(), machine: Machine::new(now),
             generation: u64::MAX, saved: None, home: None, transition: Transition::Cut, view: None,
-            cards: Default::default(), shrunk: Default::default(), zoom: 1.0,
+            cards: Default::default(), shrunk: Default::default(), recent: Vec::new(), pressure: crate::health::Level::Calm, zoom: 1.0,
             drawn: Default::default(), stale: Default::default(), progress_checked: Instant::now(), showed: false,
             wakes: 0, kept_on: Instant::now(),
             alerts: 0, alarm_results: 0, glance_tries: 0, ran: None, glance_minute: 0, backlight_off: false, nest_alerts: NEST_ALERTS.load(std::sync::atomic::Ordering::Relaxed),
@@ -624,6 +654,15 @@ impl Runtime {
                     logf!("ui: nlclient's display keeper isn't running: nudging nlclient");
                     self.sender.nudge_nlclient();
                 }
+                // Memory tighter than it was (the gen 2's): fewer frames
+                // kept, and none of the dials' spare ones.
+                let pressure = crate::health::level();
+                if pressure > self.pressure {
+                    logf!("ui: memory is {}: keeping {} cards' frames", pressure.name(), frame_budget());
+                    self.stills.clear();
+                    self.fit_frames(usize::MAX);
+                }
+                self.pressure = pressure;
                 let rests = device::rests();
                 if rests != self.machine.rests {
                     logf!("ui: {}", if rests { "holds the display at rest" } else { "hands the display back at rest" });
@@ -951,7 +990,10 @@ impl Runtime {
                     // The gen 2 leaves its core to the rest at least as long
                     // as a frame took (device::favour).
                     if crate::device::current().generation == 2 {
-                        std::thread::sleep(took);
+                        // Twice as long while its memory is tight: nlclient
+                        // is reading its pages back.
+                        let tight = crate::health::level() != crate::health::Level::Calm;
+                        std::thread::sleep(if tight { took * 2 } else { took });
                     }
                     let shown = Instant::now();
                     if let Some(gap) = self.paced.0.map(|last| shown.duration_since(last)).filter(|gap| *gap < LULL) {
@@ -992,7 +1034,9 @@ impl Runtime {
                 let deck = self.machine.deck().len() as i64;
                 let at = self.view.map_or(0, |view| view.round() as i64);
                 let nearest = (0..deck).flat_map(|d| [at - d, at + d + 1]).filter(|k| (0..deck).contains(k));
-                let keys: Vec<usize> = nearest.map(|k| self.key(k)).filter(|&index| index != 0).collect();
+                // No more of them than are kept: the rest are drawn as the
+                // ring comes to them.
+                let keys: Vec<usize> = nearest.map(|k| self.key(k)).filter(|&index| index != 0).take(frame_budget()).collect();
                 if let Some(&index) = keys.iter().find(|i| self.stale.contains(i) || !self.cards.contains_key(i)) {
                     self.prepare_key(index);
                     // Shown, if the cards are: it may be one of those showing.
@@ -1463,6 +1507,7 @@ impl Runtime {
 
     /// Forgets the frames of the card with key `index`.
     fn forget(&mut self, index: usize) {
+        self.recent.retain(|&key| key != index);
         self.cards.remove(&index);
         self.shrunk.remove(&index);
         self.drawn.remove(&index);
@@ -1471,6 +1516,7 @@ impl Runtime {
 
     /// Forgets every card's frames.
     fn forget_all(&mut self) {
+        self.recent.clear();
         self.cards.clear();
         self.shrunk.clear();
         self.drawn.clear();
@@ -1499,6 +1545,10 @@ impl Runtime {
     /// out of date and the cards are at rest: while they move, the frame it
     /// has shows.
     fn prepare_key(&mut self, index: usize) {
+        if index != 0 {
+            self.recent.retain(|&key| key != index);
+            self.recent.push(index);
+        }
         if index == 0 || self.cards.contains_key(&index) && !(self.stale.contains(&index) && !self.moving()) {
             return;
         }
@@ -1524,6 +1574,15 @@ impl Runtime {
         self.shrunk.remove(&index);
         self.stale.remove(&index);
         self.drawn.insert(index, source);
+        self.fit_frames(index);
+    }
+
+    /// Forgets the frames asked for longest ago, down to as many as are
+    /// kept (frame_budget): never `keep`'s.
+    fn fit_frames(&mut self, keep: usize) {
+        for index in over_budget(&self.recent, self.cards.len(), frame_budget(), keep) {
+            self.forget(index);
+        }
     }
 
     /// Card `at` as a frame (nlclient's for the thermostat).
@@ -2735,6 +2794,24 @@ fn off_dial(page: &[u8]) -> bool {
 /// Every screen, drawn to PNGs in UNFR0ZEN_UI_SHOTS with the fonts in
 /// UNFR0ZEN_UI_FONTS (the unit's /nestlabs/share/fonts): how they look,
 /// without a unit. `cargo test -p nestlocal ui_shots -- --ignored`
+#[cfg(test)]
+mod budget_tests {
+    use super::over_budget;
+
+    #[test]
+    fn the_frames_asked_for_longest_ago_go_first_and_never_the_one_just_drawn() {
+        // Seven kept, six allowed: the oldest goes.
+        assert_eq!(over_budget(&[4, 2, 9, 1, 3, 5, 7], 7, 6, 7), vec![4]);
+        // Memory tight: down to three, oldest first.
+        assert_eq!(over_budget(&[4, 2, 9, 1, 3, 5], 6, 3, usize::MAX), vec![4, 2, 9]);
+        // The one just drawn is kept though it is the oldest asked for.
+        assert_eq!(over_budget(&[4, 2, 9], 3, 2, 4), vec![2]);
+        // Within the budget, and where frames aren't counted: none.
+        assert!(over_budget(&[4, 2], 2, 6, 2).is_empty());
+        assert!(over_budget(&[4, 2, 9], 3, usize::MAX, 9).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod shots {
     use super::*;

@@ -12,6 +12,7 @@ mod device;
 mod doom;
 mod entropy;
 mod flags;
+mod health;
 mod heatlink;
 mod hotwater;
 mod json;
@@ -281,6 +282,7 @@ async fn run(config: flags::Config) {
         doom::start();
     }
     if let Some(bridge) = &bridge {
+        health::start(bridge.clone());
         ui::start(bridge.ui.clone(), bridge.clone());
     }
     if let (true, Some(bridge)) = (config.zigbee, &bridge) {

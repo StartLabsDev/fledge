@@ -87,15 +87,14 @@ pub fn beat(beat: u32) {
 /// Not on the gen 2, whose frames take most of its slower core: nlclient
 /// held up there misses its heartbeats, and nlheartbeatd restarts the unit.
 pub fn favour() {
-    if crate::device::current().generation == 2 {
-        return;
-    }
+    let favoured = crate::device::current().generation != 2;
     // SAFETY: setpriority on the calling thread (0), which Linux takes a
     // nice value for apart from the process's other threads.
     #[cfg(target_os = "linux")]
-    if unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, -10) } != 0 {
+    if favoured && unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, -10) } != 0 {
         crate::logf!("ui: priority: {}", std::io::Error::last_os_error());
     }
+    let _ = favoured;
 }
 
 /// Whether nlclient's patch can leave the display to go out while the UI
