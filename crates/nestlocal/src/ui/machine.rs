@@ -624,7 +624,7 @@ impl Machine {
     pub fn set_active(&mut self, nlclient: bool, now: Instant, out: &mut Vec<Effect>) {
         let active = nlclient && !self.cards.cards.is_empty();
         if !active && self.mode != Mode::Idle {
-            logf!("ui: {}", if nlclient { "no cards: the thermostat as it was" } else { "nlclient stopped: standing aside" });
+            logf!("ui: {}", if nlclient { "no cards: the thermostat as it was" } else { "standing aside: nlclient stopped, or the display is Doom's" });
             self.go(Mode::Idle, out);
         } else if active && self.mode == Mode::Idle {
             logf!("ui: {} home screen cards", self.cards.cards.len());

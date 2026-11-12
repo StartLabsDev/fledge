@@ -71,6 +71,23 @@ pub fn own(yes: bool) {
     }
 }
 
+/// Whether the display is another process's: the owner file names a live
+/// process that isn't this one, and has no heartbeat, which only the UI
+/// writes (Doom's launcher, which may outlive a restart of nestlocal). A
+/// file with a heartbeat is an earlier nestlocal's, whose pid may be reused.
+pub fn owned_elsewhere() -> bool {
+    foreign_owner(&std::fs::read_to_string(OWNER).unwrap_or_default())
+        // SAFETY: signal 0 only asks whether the process exists.
+        .is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0)
+}
+
+/// The pid an owner file names, when it has no heartbeat and isn't ours.
+fn foreign_owner(text: &str) -> Option<i32> {
+    let mut words = text.split_whitespace();
+    let pid = words.next()?.parse::<i32>().ok().filter(|&pid| pid > 1 && pid as u32 != std::process::id())?;
+    words.next().is_none().then_some(pid)
+}
+
 /// The owner's heartbeat: nlclient's patch (keeper.rests and on) takes the
 /// display back from an owner whose beat stops changing.
 pub fn beat(beat: u32) {
@@ -698,5 +715,20 @@ mod tests {
         Display::put(&mut page, row, side, true, &frame, 0, side - 1);
         assert_eq!(page, frame);
         assert_eq!(Display::take(&page, row, side, true), frame);
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::foreign_owner;
+
+    #[test]
+    fn only_an_owner_without_a_heartbeat_that_is_not_us_is_another_s() {
+        assert_eq!(foreign_owner("4321\n"), Some(4321), "Doom's launcher");
+        assert_eq!(foreign_owner("4321 17"), None, "an earlier nestlocal's, with its heartbeat");
+        assert_eq!(foreign_owner(&std::process::id().to_string()), None, "ours");
+        assert_eq!(foreign_owner(""), None);
+        assert_eq!(foreign_owner("1"), None);
+        assert_eq!(foreign_owner("x"), None);
     }
 }

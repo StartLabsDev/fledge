@@ -296,8 +296,11 @@ pub fn start(ui: Arc<Ui>, sender: Arc<dyn Sender>) {
             (Ok(display), Ok(input)) => (display, input),
             (Err(e), _) | (_, Err(e)) => return logf!("ui: {e}: no home screen cards"),
         };
-        // An owner file from before a restart names a pid that may be reused.
-        device::own(false);
+        // An owner file from before a restart names a pid that may be reused;
+        // Doom's, still playing, is left.
+        if !device::owned_elsewhere() {
+            device::own(false);
+        }
         // One left off by a nestlocal that stopped would keep the Nest dark.
         device::backlight(true);
         device::favour();
@@ -395,6 +398,8 @@ struct Runtime {
     /// When nlclient was last nudged to start the patch's display keeper.
     last_nudge: Option<Instant>,
     nlclient: bool,
+    /// The display is another process's (Doom, beside nlclient).
+    elsewhere: bool,
     /// When the button went down, whether its hold was taken as a long
     /// press, and whether the display was lit then.
     pressed: Option<(Instant, bool, bool)>,
@@ -607,7 +612,7 @@ impl Runtime {
             seen: (SEEN_FAR.load(std::sync::atomic::Ordering::Relaxed), SEEN_NEAR.load(std::sync::atomic::Ordering::Relaxed)),
             rest: false, black: false, beat: 0, last_beat: now,
             scratch: vec![0; (paint::side() * paint::side() * 4) as usize], sweep: None, live: None, ticker: None, last_frame: now,
-            last_check: now - Duration::from_secs(10), last_nudge: None, nlclient: false, frames: Default::default(), spent: Default::default(), paced: Default::default(),
+            last_check: now - Duration::from_secs(10), last_nudge: None, nlclient: false, elsewhere: false, frames: Default::default(), spent: Default::default(), paced: Default::default(),
             pressed: None, back_chosen: None, back_since: None, native_input: now, settings_checked: now, settings_seen: 0, native_settings: false,
             nest_checked: now - Duration::from_secs(10), pulse: None, next_pulse: now, glide: None, force_draw: false, last_click: now, cards_stale: false, home_from: None, set_words: false, volume_view: false, progress_drawn: now, fade_next: false,
             recolour: None, stills: HashMap::new(), now_shown: (0.0, 0.0), now_side: 1.0,
@@ -663,6 +668,7 @@ impl Runtime {
                     self.fit_frames(usize::MAX);
                 }
                 self.pressure = pressure;
+                self.elsewhere = device::owned_elsewhere();
                 let rests = device::rests();
                 if rests != self.machine.rests {
                     logf!("ui: {}", if rests { "holds the display at rest" } else { "hands the display back at rest" });
@@ -680,7 +686,8 @@ impl Runtime {
                     alert.art = self.ui.art(&key);
                 }
             }
-            self.machine.set_active(self.nlclient, now, &mut effects);
+            // Doom plays beside nlclient: the display and input are its own.
+            self.machine.set_active(self.nlclient && !self.elsewhere && !crate::doom::playing(), now, &mut effects);
             if now.duration_since(self.nest_checked) >= Duration::from_secs(1) && !self.moving() {
                 self.nest_checked = now;
                 self.refresh_nest();
