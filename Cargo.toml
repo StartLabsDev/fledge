@@ -28,6 +28,11 @@ opt-level = 3
 [profile.thermostat.package.ab_glyph_rasterizer]
 opt-level = 3
 
+# And the UI's own drawing in nestlocal: the gen 2's core composes, overlays
+# and scales each frame itself.
+[profile.thermostat.package.nestlocal]
+opt-level = 3
+
 [profile.dev.package.rsa]
 opt-level = 3
 

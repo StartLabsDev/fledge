@@ -60,8 +60,10 @@ pub fn build(source: &[u8], object: &[u8]) -> Result<Built> {
     // Without nlclient's display report found, custom_ui_change is never
     // called: nothing is routed through it.
     externals.insert("native_ui_change".into(), discovery.ui_change.as_ref().map_or(0, |ui| ui.reporter));
-    // Without the screen hand-over (the gen 2), its natives are never called
-    // and its thread never starts (layout_HANDOVER 0).
+    // Without the screen hand-over, its natives are never called and its
+    // thread never starts (layout_HANDOVER 0). With it, one of the two
+    // presents is found, custom_swap (EGL) or custom_present (the gen 2's
+    // framebuffer), and one of the two thread starts: the others link as 0.
     let handover = super::discovery::handover(&discovery.native_api);
     for key in super::discovery::handover_keys() {
         externals.entry(key.into()).or_insert(0);
@@ -105,9 +107,13 @@ pub fn build(source: &[u8], object: &[u8]) -> Result<Built> {
         let target = linked.symbols[&format!("custom_{bucket}_commit")];
         output[slot..slot + 4].copy_from_slice(&target.to_le_bytes());
     }
-    // nlclient's one eglSwapBuffers call goes through custom_swap, which
-    // skips presenting while unfr0zen's UI owns the display.
-    if handover {
+    // nlclient's one eglSwapBuffers call goes through custom_swap, or on the
+    // gen 2 its framebuffer present's vtable slot names custom_present: both
+    // skip presenting while unfr0zen's UI owns the display.
+    if let Some(&slot) = discovery.anchors.get("present_slot") {
+        let offset = elf.offset(slot)?;
+        output[offset..offset + 4].copy_from_slice(&linked.symbols["custom_present"].to_le_bytes());
+    } else if handover {
         let swap_call = discovery.anchors["swap_call_slot"];
         let swap_offset = elf.offset(swap_call)?;
         let delta = linked.symbols["custom_swap"] as i64 - swap_call as i64 - 8;
@@ -164,7 +170,7 @@ pub fn build(source: &[u8], object: &[u8]) -> Result<Built> {
         "payload_address":address,"payload_offset":offset,"payload_size":linked.bytes.len(),"entry":linked.entry,
         "symbols":linked.symbols,"native_api":discovery.native_api,"discovery":discovery,
         "image":"/nestlabs/share/images/G_unfr0zen_192px.png","runtime_directory":"/var/run/unfr0zen","wheel_trace":false,
-        "swap_call":discovery.anchors.get("swap_call_slot"),"ui_change":discovery.ui_change,"settings_menu":{"address":menu_address,"file_offset":menu_offset,"original":menu_names,"unfr0zen_index":1}
+        "swap_call":discovery.anchors.get("swap_call_slot"),"present_slot":discovery.anchors.get("present_slot"),"ui_change":discovery.ui_change,"settings_menu":{"address":menu_address,"file_offset":menu_offset,"original":menu_names,"unfr0zen_index":1}
     });
     let journal = Patch::journal(source, &output)?;
     if Patch::parse(&journal)?.apply(source, false)? != output {

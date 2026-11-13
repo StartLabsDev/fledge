@@ -16,6 +16,9 @@ export NESTLOCAL_RADIO_EM357=${NESTLOCAL_RADIO_EM357:-$thread_root/build/radio-e
 nestlocal_target_dir=${NESTLOCAL_TARGET_DIR:-.work/nestlocal-target}
 mkdir -p build/thread
 sh platform/common/wakefilter/build.sh build/wakefilter
+# Every unit's core (Cortex-A8 or A9) has NEON, which the UI's per-pixel
+# loops vectorise to.
+export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS="${CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS:-} -C target-feature=+neon"
 cargo zigbuild --locked -p nestlocal --bin nestlocal --bin thread-rcp --profile thermostat \
   --target armv7-unknown-linux-musleabihf --target-dir "$nestlocal_target_dir"
 cp "$nestlocal_target_dir"/armv7-unknown-linux-musleabihf/thermostat/thread-rcp build/thread/

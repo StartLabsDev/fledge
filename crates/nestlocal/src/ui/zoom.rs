@@ -3,13 +3,20 @@
 //! it reads as moving between cards rather than working one.
 //!
 //! All in the framebuffer's layout (device::Frame): an upright column is a
-//! framebuffer row, so the cards' sideways movement moves whole rows.
+//! framebuffer row, so the cards' sideways movement moves whole rows. A
+//! frame has the panel's side in pixels (paint::side); spacing() and reach()
+//! are in the screens' units (paint::SIZE).
 
 use super::device::Frame;
 
 const SIDE: usize = 480;
-const ROW: usize = SIDE * 4;
 const CENTRE: f32 = SIDE as f32 / 2.0;
+
+/// A square frame's side, in pixels, and pixels a unit on it.
+fn side_of(frame: &[u8]) -> (usize, f32) {
+    let side = ((frame.len() / 4) as f64).sqrt().round() as usize;
+    (side, side as f32 / SIDE as f32)
+}
 
 /// What's round and between the cards: black, so the cards (Fledge's
 /// navy faces among them) stand out from it.
@@ -17,10 +24,10 @@ fn backdrop() -> [u8; 3] {
     [0, 0, 0]
 }
 
-/// A frame of nothing but the backdrop.
-fn backdrop_frame() -> Frame {
+/// A frame of nothing but the backdrop, `side` pixels across.
+fn backdrop_frame(side: usize) -> Frame {
     let [b, g, r] = backdrop();
-    [b, g, r, 0xff].repeat(SIDE * SIDE)
+    [b, g, r, 0xff].repeat(side * side)
 }
 
 /// How small the cards are while the ring moves between them: room round
@@ -55,20 +62,22 @@ pub fn reach(z: f32) -> f32 {
 pub fn round(frame: &mut [u8]) {
     let back = backdrop();
     let fill = [back[0], back[1], back[2]];
+    let (side, _) = side_of(frame);
+    let centre = side as f32 / 2.0;
     let pixels = frame.as_chunks_mut::<4>().0;
-    let outer = CENTRE + 0.5;
-    for r in 0..SIDE {
-        let dy = r as f32 + 0.5 - CENTRE;
+    let outer = centre + 0.5;
+    for r in 0..side {
+        let dy = r as f32 + 0.5 - centre;
         // Columns this far from the middle or less are wholly inside.
         let inside = ((outer - 1.0) * (outer - 1.0) - dy * dy).max(0.0).sqrt();
-        let (first, last) = ((CENTRE - inside).ceil() as usize, ((CENTRE + inside).floor() as usize).min(SIDE));
-        let row = &mut pixels[r * SIDE..(r + 1) * SIDE];
-        let (left, rest) = row.split_at_mut(first.min(SIDE));
+        let (first, last) = ((centre - inside).ceil() as usize, ((centre + inside).floor() as usize).min(side));
+        let row = &mut pixels[r * side..(r + 1) * side];
+        let (left, rest) = row.split_at_mut(first.min(side));
         let right = &mut rest[last.saturating_sub(first)..];
-        let right_from = SIDE - right.len();
+        let right_from = side - right.len();
         for (edge, from) in [(left, 0), (right, right_from)] {
             for (i, pixel) in edge.iter_mut().enumerate() {
-                let dx = (from + i) as f32 + 0.5 - CENTRE;
+                let dx = (from + i) as f32 + 0.5 - centre;
                 let square = dx * dx + dy * dy;
                 if square >= outer * outer {
                     pixel[..3].copy_from_slice(&fill);
@@ -90,23 +99,25 @@ pub fn round(frame: &mut [u8]) {
 /// whole pixels at a time doesn't shimmer. In whole numbers, with each
 /// output row's and column's sources worked out once: a few milliseconds.
 pub fn shrink(frame: &[u8]) -> Frame {
-    let mut out = backdrop_frame();
-    let half = CENTRE * zoomed();
-    let (low, high) = ((CENTRE - half).floor() as usize, ((CENTRE + half).ceil() as usize).min(SIDE));
+    let (side, _) = side_of(frame);
+    let centre = side as f32 / 2.0;
+    let mut out = backdrop_frame(side);
+    let half = centre * zoomed();
+    let (low, high) = ((centre - half).floor() as usize, ((centre + half).ceil() as usize).min(side));
     // For each output line: its two source lines and the second's weight, of 256.
-    let sources: Vec<(usize, usize, u32)> = (0..SIDE)
+    let sources: Vec<(usize, usize, u32)> = (0..side)
         .map(|i| {
-            let source = (i as f32 + 0.5 - CENTRE) / zoomed() + CENTRE - 0.5;
-            let first = source.floor().clamp(0.0, (SIDE - 1) as f32) as usize;
+            let source = (i as f32 + 0.5 - centre) / zoomed() + centre - 0.5;
+            let first = source.floor().clamp(0.0, (side - 1) as f32) as usize;
             let weight = ((source - source.floor()) * 256.0).round().clamp(0.0, 256.0) as u32;
-            (first, (first + 1).min(SIDE - 1), weight)
+            (first, (first + 1).min(side - 1), weight)
         })
         .collect();
     let pixels = frame.as_chunks::<4>().0;
     let output = out.as_chunks_mut::<4>().0;
     for r in low..high {
         let (r0, r1, wr) = sources[r];
-        let (top, bottom) = (&pixels[r0 * SIDE..(r0 + 1) * SIDE], &pixels[r1 * SIDE..(r1 + 1) * SIDE]);
+        let (top, bottom) = (&pixels[r0 * side..(r0 + 1) * side], &pixels[r1 * side..(r1 + 1) * side]);
         for c in low..high {
             let (c0, c1, wc) = sources[c];
             let mut pixel = [0u8, 0, 0, 0xff];
@@ -115,7 +126,7 @@ pub fn shrink(frame: &[u8]) -> Frame {
                 let lower = bottom[c0][k] as u32 * (256 - wc) + bottom[c1][k] as u32 * wc;
                 pixel[k] = ((upper * (256 - wr) + lower * wr + (1 << 15)) >> 16) as u8;
             }
-            output[r * SIDE + c] = pixel;
+            output[r * side + c] = pixel;
         }
     }
     outline(&mut out, half);
@@ -130,27 +141,29 @@ const EDGE: [u8; 3] = [70, 74, 82];
 /// `frame`, over what is there, softened over a pixel each side.
 fn outline(frame: &mut [u8], radius: f32) {
     const WIDTH: f32 = 1.4;
+    let (side, _) = side_of(frame);
+    let centre = side as f32 / 2.0;
     let pixels = frame.as_chunks_mut::<4>().0;
-    let (low, high) = ((CENTRE - radius - 2.0).max(0.0) as usize, ((CENTRE + radius + 2.0) as usize).min(SIDE));
+    let (low, high) = ((centre - radius - 2.0).max(0.0) as usize, ((centre + radius + 2.0) as usize).min(side));
     // The edge's middle, and how far either side of it anything is drawn.
     let (middle, half) = (radius - WIDTH / 2.0 - 0.5, WIDTH / 2.0 + 0.5);
     for r in low..high {
-        let dy = r as f32 + 0.5 - CENTRE;
+        let dy = r as f32 + 0.5 - centre;
         // Only the columns the edge crosses in this row: a band either side.
         let extent = |from_middle: f32| (from_middle * from_middle - dy * dy).max(0.0).sqrt();
         let (near, far) = (extent((middle - half).max(0.0)), extent(middle + half));
         let band = |a: f32, b: f32| ((a.floor() as usize).clamp(low, high), ((b.ceil() as usize) + 1).clamp(low, high));
-        let (left, right) = (band(CENTRE - far - 1.0, CENTRE - near), band(CENTRE + near - 1.0, CENTRE + far));
+        let (left, right) = (band(centre - far - 1.0, centre - near), band(centre + near - 1.0, centre + far));
         // Near the top and bottom the two bands meet: once over each column.
         let columns = if left.1 >= right.0 { (left.0..right.1).chain(0..0) } else { (left.0..left.1).chain(right.0..right.1) };
         for c in columns {
-            let dx = c as f32 + 0.5 - CENTRE;
+            let dx = c as f32 + 0.5 - centre;
             let from_edge = ((dx * dx + dy * dy).sqrt() - middle).abs();
             let cover = (half - from_edge).clamp(0.0, 1.0);
             if cover <= 0.0 {
                 continue;
             }
-            let pixel = &mut pixels[r * SIDE + c];
+            let pixel = &mut pixels[r * side + c];
             // BGRX, as the framebuffer holds it.
             for (k, value) in [EDGE[2], EDGE[1], EDGE[0]].into_iter().enumerate() {
                 let old = pixel[k] as f32;
@@ -179,34 +192,36 @@ pub fn compose<'a>(out: &mut [u8], at: f32, z: f32, scale: f32, card: impl Fn(i6
             *pixel = [back[0], back[1], back[2], 0xff];
         }
     }
-    let gap = spacing(z);
-    let half = CENTRE * z;
-    let first = (at - CENTRE / gap).floor() as i64 - 1;
-    let last = (at + CENTRE / gap).ceil() as i64 + 1;
+    let (side, k_px) = side_of(out);
+    let (row_len, middle) = (side * 4, side as f32 / 2.0);
+    let gap = spacing(z) * k_px;
+    let half = middle * z;
+    let first = (at - middle / gap).floor() as i64 - 1;
+    let last = (at + middle / gap).ceil() as i64 + 1;
     // Columns are the same for every card: the cards only move sideways.
-    let columns: Vec<usize> = (0..SIDE)
-        .map(|c| (((c as f32 + 0.5 - CENTRE) * factor + CENTRE) as isize).clamp(0, SIDE as isize - 1) as usize)
+    let columns: Vec<usize> = (0..side)
+        .map(|c| (((c as f32 + 0.5 - middle) * factor + middle) as isize).clamp(0, side as isize - 1) as usize)
         .collect();
-    let (low, high) = ((CENTRE - half).max(0.0) as usize, ((CENTRE + half).ceil() as usize).min(SIDE));
+    let (low, high) = ((middle - half).max(0.0) as usize, ((middle + half).ceil() as usize).min(side));
     for k in first..=last {
         let Some(frame) = card(k) else { continue };
-        let centre = CENTRE + (k as f32 - at) * gap;
-        let (top, bottom) = ((centre - half).floor().max(0.0) as i64, ((centre + half).ceil() as i64).min(SIDE as i64));
+        let centre = middle + (k as f32 - at) * gap;
+        let (top, bottom) = ((centre - half).floor().max(0.0) as i64, ((centre + half).ceil() as i64).min(side as i64));
         for r in top.max(0)..bottom {
             let r = r as usize;
-            let row = &mut out[r * ROW..(r + 1) * ROW];
+            let row = &mut out[r * row_len..(r + 1) * row_len];
             if shrunk {
-                let source = r as i64 - centre.round() as i64 + CENTRE as i64;
-                if (0..SIDE as i64).contains(&source) {
+                let source = r as i64 - centre.round() as i64 + middle as i64;
+                if (0..side as i64).contains(&source) {
                     let source = source as usize;
-                    row.copy_from_slice(&frame[source * ROW..(source + 1) * ROW]);
+                    row.copy_from_slice(&frame[source * row_len..(source + 1) * row_len]);
                 }
             } else {
-                let source = (r as f32 + 0.5 - centre) * factor + CENTRE;
-                if !(0.0..SIDE as f32).contains(&source) {
+                let source = (r as f32 + 0.5 - centre) * factor + middle;
+                if !(0.0..side as f32).contains(&source) {
                     continue;
                 }
-                let line = frame[source as usize * ROW..(source as usize + 1) * ROW].as_chunks::<4>().0;
+                let line = frame[source as usize * row_len..(source as usize + 1) * row_len].as_chunks::<4>().0;
                 let pixels = row.as_chunks_mut::<4>().0;
                 for (pixel, &from) in pixels[low..high].iter_mut().zip(&columns[low..high]) {
                     *pixel = line[from];
@@ -225,18 +240,20 @@ pub fn focus(out: &mut [u8], at: f32, z: f32, accent: Option<[u8; 3]>) {
     if zoomed_out <= 0.0 {
         return;
     }
-    let gap = spacing(z);
-    let half = CENTRE * z;
+    let (side, k_px) = side_of(out);
+    let (row_len, middle) = (side * 4, side as f32 / 2.0);
+    let gap = spacing(z) * k_px;
+    let half = middle * z;
     // The cards beside the middle: darker the further they are, to 55%.
-    for r in 0..SIDE {
-        let along = (r as f32 + 0.5 - CENTRE) / gap + at;
+    for r in 0..side {
+        let along = (r as f32 + 0.5 - middle) / gap + at;
         let k = along.round();
         let shade = 1.0 - 0.45 * zoomed_out * (k - at).abs().min(1.0);
         if shade >= 0.999 {
             continue;
         }
         let w = (shade * 256.0) as u32;
-        for pixel in out[r * ROW..(r + 1) * ROW].as_chunks_mut::<4>().0 {
+        for pixel in out[r * row_len..(r + 1) * row_len].as_chunks_mut::<4>().0 {
             let p = u32::from_le_bytes(*pixel);
             let even = ((p & 0x00ff_00ff) * w) >> 8 & 0x00ff_00ff;
             let odd = (((p >> 8) & 0x00ff_00ff) * w) & 0xff00_ff00;
@@ -251,10 +268,10 @@ pub fn focus(out: &mut [u8], at: f32, z: f32, accent: Option<[u8; 3]>) {
     }
     let [red, green, blue] = accent.unwrap_or(RIM);
     let colour = [blue as f32, green as f32, red as f32];
-    let centre = CENTRE + (k - at) * gap;
-    let radius = half - 1.0;
-    let reach = radius + HALO;
-    let (low, high) = (((centre - reach).floor().max(0.0)) as usize, ((centre + reach).ceil() as usize).min(SIDE));
+    let centre = middle + (k - at) * gap;
+    let (radius, halo) = (half - 1.0, HALO * k_px);
+    let reach = radius + halo;
+    let (low, high) = (((centre - reach).floor().max(0.0)) as usize, ((centre + reach).ceil() as usize).min(side));
     let pixels = out.as_chunks_mut::<4>().0;
     for r in low..high {
         let dx = r as f32 + 0.5 - centre;
@@ -262,19 +279,19 @@ pub fn focus(out: &mut [u8], at: f32, z: f32, accent: Option<[u8; 3]>) {
         // inside: two bands either side of the card in this row.
         let outer = (reach * reach - dx * dx).max(0.0).sqrt();
         let inner = ((radius - 2.5).max(0.0).powi(2) - dx * dx).max(0.0).sqrt();
-        let bands = [(CENTRE - outer, CENTRE - inner), (CENTRE + inner, CENTRE + outer)];
+        let bands = [(middle - outer, middle - inner), (middle + inner, middle + outer)];
         for (a, b) in bands {
-            let (a, b) = ((a.floor().max(0.0)) as usize, (b.ceil() as usize).min(SIDE));
+            let (a, b) = ((a.floor().max(0.0)) as usize, (b.ceil() as usize).min(side));
             for c in a..b {
-                let dy = c as f32 + 0.5 - CENTRE;
+                let dy = c as f32 + 0.5 - middle;
                 let d = (dx * dx + dy * dy).sqrt();
                 let rim = (1.0 - (d - radius).abs() / 1.6).clamp(0.0, 1.0) * 0.85;
-                let glow = if d > radius { (1.0 - (d - radius) / HALO).clamp(0.0, 1.0).powi(2) * 0.38 } else { 0.0 };
+                let glow = if d > radius { (1.0 - (d - radius) / halo).clamp(0.0, 1.0).powi(2) * 0.38 } else { 0.0 };
                 let (rim, glow) = (rim * strength, glow * strength);
                 if rim <= 0.0 && glow <= 0.0 {
                     continue;
                 }
-                let pixel = &mut pixels[r * SIDE + c];
+                let pixel = &mut pixels[r * side + c];
                 for (channel, &value) in pixel[..3].iter_mut().zip(&colour) {
                     let old = *channel as f32;
                     let lit = old + (value - old) * rim;
@@ -293,6 +310,8 @@ const HALO: f32 = 22.0;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ROW: usize = SIDE * 4;
 
     fn card(shade: u8) -> Frame {
         let mut frame = vec![0u8; SIDE * ROW];

@@ -5,13 +5,21 @@
 //! All in the framebuffer's layout (device::Frame): an upright column is a
 //! framebuffer row (upright x = row), and upright y runs backwards along a
 //! row (column = 479 - y). So sideways moves are whole rows, and up and
-//! down moves are offsets within each row.
+//! down moves are offsets within each row. A frame is square, as many
+//! pixels a side as the panel has (paint::side); distances are in the
+//! screens' units (paint::SIZE).
 
 use std::time::Duration;
 
-const SIDE: usize = 480;
-const ROW: usize = SIDE * 4;
-const CENTRE: f32 = SIDE as f32 / 2.0;
+/// A square frame's side, in pixels.
+fn side_of(frame: &[u8]) -> usize {
+    ((frame.len() / 4) as f64).sqrt().round() as usize
+}
+
+/// Pixels a unit on a frame `side` pixels across.
+fn per_unit(side: usize) -> f32 {
+    side as f32 / super::paint::SIZE as f32
+}
 
 /// Things leaving, press feedback, small labels.
 pub const FAST: Duration = Duration::from_millis(250);
@@ -84,14 +92,16 @@ impl Kind {
 }
 
 /// How far a pushed screen moves: 14% of the display.
-const PUSH: f32 = SIDE as f32 * 0.14;
-/// How far a notification drops from.
+const PUSH: f32 = 0.14;
+/// How far a notification drops from, in units.
 const DROP: f32 = 96.0;
 
 /// The frame `t` (0 to 1, in time) of the way from `from` to `to`, into `out`.
 pub fn frame(kind: Kind, from: &[u8], to: &[u8], t: f32, out: &mut [u8]) {
     let t = t.clamp(0.0, 1.0);
     let e = curve(t);
+    let side = side_of(out);
+    let (row, drop) = (side * 4, DROP * per_unit(side));
     match kind {
         Kind::Cut => out.copy_from_slice(to),
         Kind::Fade => blend(from, to, e, out),
@@ -107,10 +117,11 @@ pub fn frame(kind: Kind, from: &[u8], to: &[u8], t: f32, out: &mut [u8]) {
         Kind::Push | Kind::Pop => {
             let sign = if kind == Kind::Push { 1.0 } else { -1.0 };
             // The old screen leaves towards -sign, the new one comes from +sign.
-            let old = -sign * PUSH * e;
-            let new = sign * PUSH * (1.0 - e);
-            for r in 0..SIDE {
-                let row = &mut out[r * ROW..(r + 1) * ROW];
+            let push = PUSH * side as f32;
+            let old = -sign * push * e;
+            let new = sign * push * (1.0 - e);
+            for r in 0..side {
+                let row = &mut out[r * row..(r + 1) * row];
                 let a = row_at(from, r as f32 - old);
                 let b = row_at(to, r as f32 - new);
                 mix_rows(a, b, e, row);
@@ -127,12 +138,12 @@ pub fn frame(kind: Kind, from: &[u8], to: &[u8], t: f32, out: &mut [u8]) {
             blend(&menu, to, e, out);
         }
         Kind::Drop => {
-            shift_y(to, -DROP * (1.0 - e), out);
+            shift_y(to, -drop * (1.0 - e), out);
             let alert = out.to_vec();
             blend(from, &alert, e, out);
         }
         Kind::Lift => {
-            shift_y(from, -DROP * e, out);
+            shift_y(from, -drop * e, out);
             let alert = out.to_vec();
             blend(&alert, to, e, out);
         }
@@ -141,8 +152,8 @@ pub fn frame(kind: Kind, from: &[u8], to: &[u8], t: f32, out: &mut [u8]) {
 
 /// Framebuffer row `r` (an upright column) of `frame`, or black off its edge.
 fn row_at(frame: &[u8], r: f32) -> Option<&[u8]> {
-    let r = r.round();
-    (0.0..SIDE as f32).contains(&r).then(|| &frame[r as usize * ROW..(r as usize + 1) * ROW])
+    let (r, side) = (r.round(), side_of(frame));
+    (0.0..side as f32).contains(&r).then(|| &frame[r as usize * side * 4..(r as usize + 1) * side * 4])
 }
 
 /// `a` (or black) and `b` (or black) mixed, `b` at `e`.
@@ -209,16 +220,18 @@ pub fn transform(frame: &[u8], zoom: f32, angle: f32, out: &mut [u8]) {
     // quarter turn keeps).
     let (sin, cos) = angle.sin_cos();
     let (a, b) = (cos / zoom, sin / zoom);
+    let side = side_of(frame);
+    let centre = side as f32 / 2.0;
     let source = frame.as_chunks::<4>().0;
     let pixels = out.as_chunks_mut::<4>().0;
-    for r in 0..SIDE {
-        let y = r as f32 + 0.5 - CENTRE;
+    for r in 0..side {
+        let y = r as f32 + 0.5 - centre;
         // Source for column 0, then a step per column.
-        let x0 = 0.5 - CENTRE;
-        let (mut u, mut v) = (a * x0 - b * y + CENTRE, b * x0 + a * y + CENTRE);
-        for pixel in &mut pixels[r * SIDE..(r + 1) * SIDE] {
-            *pixel = if (0.0..SIDE as f32).contains(&u) && (0.0..SIDE as f32).contains(&v) {
-                source[v as usize * SIDE + u as usize]
+        let x0 = 0.5 - centre;
+        let (mut u, mut v) = (a * x0 - b * y + centre, b * x0 + a * y + centre);
+        for pixel in &mut pixels[r * side..(r + 1) * side] {
+            *pixel = if (0.0..side as f32).contains(&u) && (0.0..side as f32).contains(&v) {
+                source[v as usize * side + u as usize]
             } else {
                 [0, 0, 0, 0xff]
             };
@@ -233,14 +246,15 @@ pub fn transform(frame: &[u8], zoom: f32, angle: f32, out: &mut [u8]) {
 pub fn shift_y(frame: &[u8], dy: f32, out: &mut [u8]) {
     // Upright y runs backwards along a framebuffer row: down is towards its start.
     let by = dy.round() as isize;
-    let n = by.unsigned_abs().min(SIDE);
-    for r in 0..SIDE {
-        let (from, to) = (&frame[r * ROW..(r + 1) * ROW], &mut out[r * ROW..(r + 1) * ROW]);
+    let side = side_of(frame);
+    let (row, n) = (side * 4, by.unsigned_abs().min(side));
+    for r in 0..side {
+        let (from, to) = (&frame[r * row..(r + 1) * row], &mut out[r * row..(r + 1) * row]);
         if by >= 0 {
-            to[..(SIDE - n) * 4].copy_from_slice(&from[n * 4..]);
-            to[(SIDE - n) * 4..].fill(0);
+            to[..(side - n) * 4].copy_from_slice(&from[n * 4..]);
+            to[(side - n) * 4..].fill(0);
         } else {
-            to[n * 4..].copy_from_slice(&from[..(SIDE - n) * 4]);
+            to[n * 4..].copy_from_slice(&from[..(side - n) * 4]);
             to[..n * 4].fill(0);
         }
     }
@@ -270,35 +284,40 @@ pub fn press(frame: &mut [u8], pressed: Pressed) {
             *channel += (((255 - *channel as u32) * amount) >> 8) as u8;
         }
     };
+    let side = side_of(frame);
+    let (k, centre) = (per_unit(side), side as f32 / 2.0);
     let pixels = frame.as_chunks_mut::<4>().0;
     match pressed {
         Pressed::Screen => {
             // Lifting the whole square greyed the dark round the ring.
-            for r in 0..SIDE {
-                let dx = r as f32 + 0.5 - CENTRE;
-                for c in 0..SIDE {
-                    let dy = c as f32 + 0.5 - CENTRE;
-                    let near = 1.0 - (dx * dx + dy * dy) / (PRESS_RADIUS * PRESS_RADIUS);
+            let radius = PRESS_RADIUS * k;
+            for r in 0..side {
+                let dx = r as f32 + 0.5 - centre;
+                for c in 0..side {
+                    let dy = c as f32 + 0.5 - centre;
+                    let near = 1.0 - (dx * dx + dy * dy) / (radius * radius);
                     if near > 0.0 {
-                        lift(&mut pixels[r * SIDE + c], (PRESS_LIFT * near) as u32);
+                        lift(&mut pixels[r * side + c], (PRESS_LIFT * near) as u32);
                     }
                 }
             }
         }
         Pressed::Card(radius) => {
-            for r in 0..SIDE {
-                let dx = r as f32 + 0.5 - CENTRE;
+            let radius = radius * k;
+            for r in 0..side {
+                let dx = r as f32 + 0.5 - centre;
                 let half = (radius * radius - dx * dx).max(0.0).sqrt();
-                let (a, b) = ((CENTRE - half).max(0.0) as usize, ((CENTRE + half) as usize).min(SIDE));
-                pixels[r * SIDE + a..r * SIDE + b].iter_mut().for_each(|p| lift(p, 30));
+                let (a, b) = ((centre - half).max(0.0) as usize, ((centre + half) as usize).min(side));
+                pixels[r * side + a..r * side + b].iter_mut().for_each(|p| lift(p, 30));
             }
         }
         Pressed::Row(x, y, w, h) => {
             // Upright x is a framebuffer row; upright y runs back along it.
-            let (r0, r1) = (x.max(0.0) as usize, ((x + w) as usize).min(SIDE));
-            let (c0, c1) = ((SIDE as f32 - (y + h)).max(0.0) as usize, ((SIDE as f32 - y) as usize).min(SIDE));
+            let (x, y, w, h) = (x * k, y * k, w * k, h * k);
+            let (r0, r1) = (x.max(0.0) as usize, ((x + w) as usize).min(side));
+            let (c0, c1) = ((side as f32 - (y + h)).max(0.0) as usize, ((side as f32 - y) as usize).min(side));
             for r in r0..r1 {
-                pixels[r * SIDE + c0..r * SIDE + c1].iter_mut().for_each(|p| lift(p, 40));
+                pixels[r * side + c0..r * side + c1].iter_mut().for_each(|p| lift(p, 40));
             }
         }
     }
@@ -307,6 +326,9 @@ pub fn press(frame: &mut [u8], pressed: Pressed) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SIDE: usize = 480;
+    const ROW: usize = SIDE * 4;
 
     fn flat(shade: u8) -> Vec<u8> {
         [shade, shade, shade, 0xff].repeat(SIDE * SIDE)

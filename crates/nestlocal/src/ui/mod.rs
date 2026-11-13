@@ -256,6 +256,9 @@ pub trait Sender: Send + Sync + 'static {
     }
     /// One of this thermostat's own commands, as <base>/set/<name> takes it.
     fn nest_command(&self, _name: &str, _arg: &str) {}
+    /// Has nlclient commit its device bucket (a field of Fledge's own in
+    /// it changed), which starts the patch's display keeper in it.
+    fn nudge_nlclient(&self) {}
 }
 
 /// Kept while the thermostat shows Nest's own dial rather than its card.
@@ -269,10 +272,42 @@ fn fledge_theme(kept: Option<&str>) -> bool {
     kept.is_none_or(|kept| kept.trim() != "nest")
 }
 
-/// Starts the UI on a gen 3 unit: it waits for cards from Home Assistant.
+/// Whether the cards only ever show full size, sliding side by side: the
+/// gen 2's 58 MB can't keep each zoomed out too (a frame is 900 KB), nor its
+/// core compose them as the ring turns.
+fn full_size_only() -> bool {
+    crate::device::current().generation == 2
+}
+
+/// How many cards' frames are kept at once, where each must be counted: on
+/// the gen 2, fewer as its memory gets tight (health.rs). A turn from one
+/// card to the next needs two.
+fn frame_budget() -> usize {
+    if !full_size_only() {
+        return usize::MAX;
+    }
+    match crate::health::level() {
+        crate::health::Level::Calm => 6,
+        crate::health::Level::Tight => 3,
+        crate::health::Level::Critical => 2,
+    }
+}
+
+/// The keys in `recent` to forget, oldest first, for `kept` frames to fit
+/// `budget`: never `keep`, the one just drawn.
+fn over_budget(recent: &[usize], kept: usize, budget: usize, keep: usize) -> Vec<usize> {
+    recent.iter().copied().filter(|&key| key != keep).take(kept.saturating_sub(budget)).collect()
+}
+
+/// Starts the UI: it waits for cards from Home Assistant.
 pub fn start(ui: Arc<Ui>, sender: Arc<dyn Sender>) {
     let handle = tokio::runtime::Handle::try_current().ok();
     let spawned = std::thread::Builder::new().name("ui".into()).spawn(move || {
+        // Paused (the unit kept restarting with them): nothing of the cards
+        // is loaded or opened until Home Assistant resumes them.
+        while crate::health::cards_paused() {
+            std::thread::sleep(Duration::from_secs(5));
+        }
         let fonts = match paint::Fonts::load(paint::FONT_DIR) {
             Ok(fonts) => fonts,
             Err(e) => return logf!("ui: {e}: no home screen cards"),
@@ -281,12 +316,17 @@ pub fn start(ui: Arc<Ui>, sender: Arc<dyn Sender>) {
             (Ok(display), Ok(input)) => (display, input),
             (Err(e), _) | (_, Err(e)) => return logf!("ui: {e}: no home screen cards"),
         };
-        // An owner file from before a restart names a pid that may be reused.
-        device::own(false);
+        // An owner file from before a restart names a pid that may be reused;
+        // Doom's, still playing, is left.
+        if !device::owned_elsewhere() {
+            device::own(false);
+        }
         // One left off by a nestlocal that stopped would keep the Nest dark.
         device::backlight(true);
         device::favour();
         paint::for_panel();
+        // Drawn at the panel's own size: the gen 2's is 320 pixels across.
+        paint::set_side(display.side() as u32);
         let _ = std::thread::Builder::new().name("ui-warm".into()).spawn(paint::warm);
         // The thermostat's own commands (an update's install) may start work
         // on nestlocal's runtime.
@@ -320,6 +360,11 @@ struct Runtime {
     /// and zoomed out (zoom::shrink; the thermostat's under 0).
     cards: std::collections::HashMap<usize, device::Frame>,
     shrunk: std::collections::HashMap<usize, device::Frame>,
+    /// The cards' keys as their frames were last asked for, oldest first:
+    /// what goes first where only so many are kept (frame_budget).
+    recent: Vec<usize>,
+    /// The memory's level the frames kept were last fitted to.
+    pressure: crate::health::Level,
     /// What each card's frame was drawn from, and the cards whose frames
     /// are out of date: kept showing while the cards move (drawing one
     /// takes several frames' time), drawn again once they rest.
@@ -370,7 +415,11 @@ struct Runtime {
     ticker: Option<Ticker>,
     last_frame: Instant,
     last_check: Instant,
+    /// When nlclient was last nudged to start the patch's display keeper.
+    last_nudge: Option<Instant>,
     nlclient: bool,
+    /// The display is another process's (Doom, beside nlclient).
+    elsewhere: bool,
     /// When the button went down, whether its hold was taken as a long
     /// press, and whether the display was lit then.
     pressed: Option<(Instant, bool, bool)>,
@@ -581,14 +630,14 @@ impl Runtime {
         Runtime {
             ui, sender, fonts, display, input, beeper: device::Beeper::open(), machine: Machine::new(now),
             generation: u64::MAX, saved: None, home: None, transition: Transition::Cut, view: None,
-            cards: Default::default(), shrunk: Default::default(), zoom: 1.0,
+            cards: Default::default(), shrunk: Default::default(), recent: Vec::new(), pressure: crate::health::Level::Calm, zoom: 1.0,
             drawn: Default::default(), stale: Default::default(), progress_checked: Instant::now(), showed: false,
             wakes: 0, kept_on: Instant::now(),
             alerts: 0, alarm_results: 0, glance_tries: 0, ran: None, glance_minute: 0, backlight_off: false, nest_alerts: NEST_ALERTS.load(std::sync::atomic::Ordering::Relaxed),
             seen: (SEEN_FAR.load(std::sync::atomic::Ordering::Relaxed), SEEN_NEAR.load(std::sync::atomic::Ordering::Relaxed)),
             rest: false, black: false, beat: 0, last_beat: now,
-            scratch: vec![0; (paint::SIZE * paint::SIZE * 4) as usize], sweep: None, live: None, ticker: None, last_frame: now,
-            last_check: now - Duration::from_secs(10), nlclient: false, frames: Default::default(), spent: Default::default(), paced: Default::default(),
+            scratch: vec![0; (paint::side() * paint::side() * 4) as usize], sweep: None, live: None, ticker: None, last_frame: now,
+            last_check: now - Duration::from_secs(10), last_nudge: None, nlclient: false, elsewhere: false, frames: Default::default(), spent: Default::default(), paced: Default::default(),
             pressed: None, back_chosen: None, back_since: None, native_input: now, settings_checked: now, settings_seen: 0, native_settings: false,
             nest_checked: now - Duration::from_secs(10), pulse: None, next_pulse: now, glide: None, force_draw: false, last_click: now, cards_stale: false, home_from: None, set_words: false, volume_view: false, progress_drawn: now, fade_next: false, options_shown: None,
             recolour: None, stills: HashMap::new(), now_shown: (0.0, 0.0), now_side: 1.0,
@@ -627,6 +676,24 @@ impl Runtime {
             if now.duration_since(self.last_check) >= Duration::from_secs(2) && !self.moving() {
                 self.last_check = now;
                 self.nlclient = !crate::pids("nlclient").is_empty();
+                // Without its keeper, nlclient never lights the display for
+                // the UI: have it commit, which starts it, every 30 s until.
+                if self.nlclient && !device::keeper_runs()
+                    && self.last_nudge.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(30)) {
+                    self.last_nudge = Some(now);
+                    logf!("ui: nlclient's display keeper isn't running: nudging nlclient");
+                    self.sender.nudge_nlclient();
+                }
+                // Memory tighter than it was (the gen 2's): fewer frames
+                // kept, and none of the dials' spare ones.
+                let pressure = crate::health::level();
+                if pressure > self.pressure {
+                    logf!("ui: memory is {}: keeping {} cards' frames", pressure.name(), frame_budget());
+                    self.stills.clear();
+                    self.fit_frames(usize::MAX);
+                }
+                self.pressure = pressure;
+                self.elsewhere = device::owned_elsewhere();
                 let rests = device::rests();
                 if rests != self.machine.rests {
                     logf!("ui: {}", if rests { "holds the display at rest" } else { "hands the display back at rest" });
@@ -644,7 +711,8 @@ impl Runtime {
                     alert.art = self.ui.art(&key);
                 }
             }
-            self.machine.set_active(self.nlclient, now, &mut effects);
+            // Doom plays beside nlclient: the display and input are its own.
+            self.machine.set_active(self.nlclient && !self.elsewhere && !crate::doom::playing(), now, &mut effects);
             if now.duration_since(self.nest_checked) >= Duration::from_secs(1) && !self.moving() {
                 self.nest_checked = now;
                 self.refresh_nest();
@@ -960,6 +1028,14 @@ impl Runtime {
                         *sum += part;
                     }
                     self.frames = (self.frames.0 + 1, self.frames.1 + took, self.frames.2.max(took));
+                    // The gen 2 leaves its core to the rest at least as long
+                    // as a frame took (device::favour).
+                    if crate::device::current().generation == 2 {
+                        // Twice as long while its memory is tight: nlclient
+                        // is reading its pages back.
+                        let tight = crate::health::level() != crate::health::Level::Calm;
+                        std::thread::sleep(if tight { took * 2 } else { took });
+                    }
                     let shown = Instant::now();
                     if let Some(gap) = self.paced.0.map(|last| shown.duration_since(last)).filter(|gap| *gap < LULL) {
                         let late = (gap > LATE) as u32;
@@ -999,12 +1075,14 @@ impl Runtime {
                 let deck = self.machine.deck().len() as i64;
                 let at = self.view.map_or(0, |view| view.round() as i64);
                 let nearest = (0..deck).flat_map(|d| [at - d, at + d + 1]).filter(|k| (0..deck).contains(k));
-                let keys: Vec<usize> = nearest.map(|k| self.key(k)).filter(|&index| index != 0).collect();
+                // No more of them than are kept: the rest are drawn as the
+                // ring comes to them.
+                let keys: Vec<usize> = nearest.map(|k| self.key(k)).filter(|&index| index != 0).take(frame_budget()).collect();
                 if let Some(&index) = keys.iter().find(|i| self.stale.contains(i) || !self.cards.contains_key(i)) {
                     self.prepare_key(index);
                     // Shown, if the cards are: it may be one of those showing.
                     self.force_draw |= self.view.is_some();
-                } else if let Some(&index) = keys.iter().find(|i| !self.shrunk.contains_key(i) && self.cards.contains_key(i)) {
+                } else if let Some(&index) = keys.iter().find(|i| !full_size_only() && !self.shrunk.contains_key(i) && self.cards.contains_key(i)) {
                     let shrunk = prof::time(prof::Part::Shrink, || zoom::shrink(&self.cards[&index]));
                     self.shrunk.insert(index, shrunk);
                 }
@@ -1227,6 +1305,9 @@ impl Runtime {
     /// Zoomed out on the cards, the chooser; full size settling back onto
     /// the thermostat, or opening a card (zoom_in).
     fn zoom_target(&self) -> f32 {
+        if full_size_only() {
+            return 1.0;
+        }
         match self.machine.mode {
             Mode::Chooser(_) => zoom::zoomed(),
             Mode::Home if self.machine.owns() => zoom::zoomed(),
@@ -1334,7 +1415,7 @@ impl Runtime {
             key => cards.get(&key).map(Vec::as_slice),
         };
         if let (Some(from), Some(to)) = (get(from), get(to)) {
-            self.display.slide(from, to, (part * paint::SIZE as f32) as usize, true);
+            self.display.slide(from, to, (part * paint::side() as f32) as usize, true);
         }
     }
 
@@ -1489,6 +1570,7 @@ impl Runtime {
 
     /// Forgets the frames of the card with key `index`.
     fn forget(&mut self, index: usize) {
+        self.recent.retain(|&key| key != index);
         self.cards.remove(&index);
         self.shrunk.remove(&index);
         self.drawn.remove(&index);
@@ -1497,6 +1579,7 @@ impl Runtime {
 
     /// Forgets every card's frames.
     fn forget_all(&mut self) {
+        self.recent.clear();
         self.cards.clear();
         self.shrunk.clear();
         self.drawn.clear();
@@ -1532,6 +1615,10 @@ impl Runtime {
     /// out of date and the cards are at rest: while they move, the frame it
     /// has shows.
     fn prepare_key(&mut self, index: usize) {
+        if index != 0 {
+            self.recent.retain(|&key| key != index);
+            self.recent.push(index);
+        }
         if index == 0 || self.cards.contains_key(&index) && !(self.stale.contains(&index) && !self.moving()) {
             return;
         }
@@ -1558,6 +1645,15 @@ impl Runtime {
         self.shrunk.remove(&index);
         self.stale.remove(&index);
         self.drawn.insert(index, source);
+        self.fit_frames(index);
+    }
+
+    /// Forgets the frames asked for longest ago, down to as many as are
+    /// kept (frame_budget): never `keep`'s.
+    fn fit_frames(&mut self, keep: usize) {
+        for index in over_budget(&self.recent, self.cards.len(), frame_budget(), keep) {
+            self.forget(index);
+        }
     }
 
     /// Card `at` as a frame (nlclient's for the thermostat).
@@ -1565,7 +1661,7 @@ impl Runtime {
         self.prepare(at);
         let index = self.key(at);
         let frame = if index == 0 { self.home.clone() } else { self.cards.get(&index).cloned() };
-        frame.unwrap_or_else(|| vec![0; (paint::SIZE * paint::SIZE * 4) as usize])
+        frame.unwrap_or_else(|| vec![0; (paint::side() * paint::side() * 4) as usize])
     }
 
     /// How far the ring of the mode's value should show (0..1), if it has one.
@@ -2088,7 +2184,7 @@ impl Runtime {
                 return;
             }
             self.black = true;
-            let black = vec![0; (paint::SIZE * paint::SIZE * 4) as usize];
+            let black = vec![0; (paint::side() * paint::side() * 4) as usize];
             let kind = std::mem::replace(&mut self.transition, Transition::Cut);
             self.transit(&black, kind);
             self.live = None;
@@ -2733,6 +2829,13 @@ fn home_dial(display: &mut device::Display) -> bool {
 
 /// Whether a frame of nlclient's is its home dial, drawn: nlclient says it
 /// shows its dial as its menu starts closing, so the frame must look it too.
+/// Whether a page is the gen 3's, 480 a side: what nlclient's screens are
+/// recognised on by their pixels. The gen 2's are told by nlclient's report
+/// (nlstate) alone.
+fn gen3_page(page: &[u8]) -> bool {
+    page.len() == 480 * 480 * 4
+}
+
 fn dial_page(page: &[u8]) -> bool {
     dial(page) && nlstate::read().is_none_or(|report| report.shows() == Shows::Dial)
 }
@@ -2756,6 +2859,9 @@ fn menu_shows(display: &mut device::Display) -> bool {
 /// middle, black near the edge above and below it (a cooling dial is blue
 /// all over).
 fn settings_tile(page: &[u8]) -> bool {
+    if !gen3_page(page) {
+        return false;
+    }
     let stride = page.len() / 480;
     let blue = |x: f32, y: f32| {
         let (x, y) = (x.round() as usize, y.round() as usize);
@@ -2787,6 +2893,9 @@ fn settings_tile(page: &[u8]) -> bool {
 /// Whether nlclient's menu shows with Back chosen: its arrow, lower left,
 /// blue (unchosen it is grey).
 fn back_chosen(page: &[u8]) -> bool {
+    if !gen3_page(page) {
+        return false;
+    }
     let stride = page.len() / 480;
     let mut blue = 0;
     for x in 78..146 {
@@ -2803,6 +2912,9 @@ fn back_chosen(page: &[u8]) -> bool {
 /// Whether nlclient's menu shows Settings chosen: its cog, below the
 /// date, lit white.
 fn settings_chosen(page: &[u8]) -> bool {
+    if !gen3_page(page) {
+        return false;
+    }
     let stride = page.len() / 480;
     let mut white = 0;
     for x in 160..222 {
@@ -2822,6 +2934,9 @@ fn blank(page: &[u8]) -> bool {
 
 /// Whether a frame shows nlclient's home dial: its ring lit around the edge.
 fn dial(page: &[u8]) -> bool {
+    if !gen3_page(page) {
+        return false;
+    }
     if off_dial(page) {
         return true;
     }
@@ -2844,6 +2959,9 @@ fn dial(page: &[u8]) -> bool {
 /// middle, and nothing else white (its menus have white icons round the
 /// edge, its Settings tiles are blue).
 fn off_dial(page: &[u8]) -> bool {
+    if !gen3_page(page) {
+        return false;
+    }
     let stride = page.len() / 480;
     let white = |x: usize, y: usize| {
         // Upright (x, y) is framebuffer row x, column 479 - y, as BGRX.
@@ -2875,6 +2993,24 @@ fn off_dial(page: &[u8]) -> bool {
 /// Every screen, drawn to PNGs in UNFR0ZEN_UI_SHOTS with the fonts in
 /// UNFR0ZEN_UI_FONTS (the unit's /nestlabs/share/fonts): how they look,
 /// without a unit. `cargo test -p nestlocal ui_shots -- --ignored`
+#[cfg(test)]
+mod budget_tests {
+    use super::over_budget;
+
+    #[test]
+    fn the_frames_asked_for_longest_ago_go_first_and_never_the_one_just_drawn() {
+        // Seven kept, six allowed: the oldest goes.
+        assert_eq!(over_budget(&[4, 2, 9, 1, 3, 5, 7], 7, 6, 7), vec![4]);
+        // Memory tight: down to three, oldest first.
+        assert_eq!(over_budget(&[4, 2, 9, 1, 3, 5], 6, 3, usize::MAX), vec![4, 2, 9]);
+        // The one just drawn is kept though it is the oldest asked for.
+        assert_eq!(over_budget(&[4, 2, 9], 3, 2, 4), vec![2]);
+        // Within the budget, and where frames aren't counted: none.
+        assert!(over_budget(&[4, 2], 2, 6, 2).is_empty());
+        assert!(over_budget(&[4, 2, 9], 3, usize::MAX, 9).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod shots {
     use super::*;
@@ -2963,6 +3099,10 @@ mod shots {
         };
         let fonts = paint::Fonts::load(&fonts).unwrap();
         paint::set_theme(if std::env::var("UNFR0ZEN_UI_THEME").is_ok_and(|t| t == "nest") { paint::Theme::Nest } else { paint::Theme::Fledge });
+        // UNFR0ZEN_UI_SIDE=320: as the gen 2's panel shows them.
+        if let Some(side) = std::env::var("UNFR0ZEN_UI_SIDE").ok().and_then(|s| s.parse().ok()) {
+            paint::preview_at(side);
+        }
         let cards = Cards::parse(br#"{"cards":[
             {"kind":"lights","name":"Bedroom","icon":"mdi:lightbulb-group","lights":[
                 {"id":"light.reading_lamp","name":"Reading Lamp","icon":"m3s:table-lamp","on":true,"dimmable":true,"brightness":60,"rgb":[255,169,87]},
@@ -3332,13 +3472,13 @@ mod shots {
         save(&screens::draw(&fonts, &Screen::NestCard { nest: Cow::Borrowed(&warm), now }, None), &format!("{out}/n6-above-target.png"));
         save(&screens::draw(&fonts, &Screen::NestSet { nest: Cow::Borrowed(&warm), target: 22.5, pulse: None, setting: true, shown: Some((0.5, 22.0)) }, None),
              &format!("{out}/n7-fading.png"));
-        let mut zoomed = vec![0u8; (paint::SIZE * paint::SIZE * 4) as usize];
         let frames: Vec<device::Frame> = [Screen::NestCard { nest: Cow::Borrowed(&cold), now }, Screen::SettingsCard,
             Screen::ActionCard { card: &scene, done: false, opened: false }].iter().map(|screen| {
                 let mut frame = screens::draw(&fonts, screen, None).pixmap.data().to_vec();
                 zoom::round(&mut frame);
                 zoom::shrink(&frame)
             }).collect();
+        let mut zoomed = vec![0u8; frames[0].len()];
         zoom::compose(&mut zoomed, 1.0, zoom::zoomed(), zoom::zoomed(), |k| frames.get(k as usize).map(Vec::as_slice));
         let plain = zoomed.clone();
         zoom::focus(&mut zoomed, 1.0, zoom::zoomed(), None);

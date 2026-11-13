@@ -130,6 +130,10 @@ impl Bridge {
             }
             return;
         }
+        if name == "resume_cards" {
+            crate::health::resume_cards();
+            return;
+        }
         if name == "check_update" {
             match self.updates() {
                 Some(updates) => updates.check.notify_one(),
