@@ -118,6 +118,8 @@ pub enum FaceStyle {
 /// screen, not part of the device).
 static FACE_STYLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(FaceStyle::BlackGlow as u8);
 
+/// Another face than Fledge's own, for the screens' previews (ui::shots).
+#[cfg(test)]
 pub fn set_face_style(style: FaceStyle) {
     FACE_STYLE.store(style as u8, std::sync::atomic::Ordering::Relaxed);
 }
