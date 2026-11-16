@@ -146,11 +146,14 @@ pub fn keeper_runs() -> bool {
 }
 
 /// Whether the gen 2's nlclient draws into private memory while the UI
-/// owns the display (custom_screen.c's custom_present): FB_PRIVATE names the
-/// nlclient running now, whose pid KEEPER holds.
+/// owns the display (custom_screen.c's custom_present): FB_PRIVATE names a
+/// running nlclient. Not KEEPER's: its display keeper starts long after
+/// nlclient does on a gen 2.
 fn nlclient_private() -> bool {
-    let read = |path| std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u32>().ok());
-    read(FB_PRIVATE).is_some_and(|pid| Some(pid) == read(KEEPER))
+    let Some(pid) = std::fs::read_to_string(FB_PRIVATE).ok().and_then(|s| s.trim().parse::<u32>().ok()) else {
+        return false;
+    };
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| comm.trim() == "nlclient")
 }
 
 /// Asks nlclient to light its display (custom_screen.c's keeper).
@@ -237,6 +240,8 @@ pub struct Display {
     shown: Frame,
     /// When the gen 2's nlclient was last seen drawing aside (recheck).
     checked: std::time::Instant,
+    /// Pans logged since begin, on the gen 2 (a few, to see them work).
+    pans_told: u8,
 }
 
 /// The two pages, as nlclient's EGL flips between them: which one shows,
@@ -293,7 +298,7 @@ impl Display {
             return Err(format!("/dev/fb0: mmap: {}", std::io::Error::last_os_error()));
         }
         Ok(Display { file, map: map.cast(), len, stride, side, turned: side == SIDE, flip: None,
-                     shown: vec![0; side * side * 4], checked: std::time::Instant::now() })
+                     shown: vec![0; side * side * 4], checked: std::time::Instant::now(), pans_told: 0 })
     }
 
     /// The panel's side in pixels.
@@ -417,6 +422,10 @@ impl Display {
             wake_display();
         }
         self.checked = std::time::Instant::now();
+        if !self.turned {
+            crate::logf!("ui: takes the display: pages {pages:?}, home {home}, shown {}", self.pan());
+            self.pans_told = 0;
+        }
     }
 
     /// On the gen 2: both pages to flip between once nlclient draws into
@@ -514,6 +523,10 @@ impl Display {
         }
         if let Err(e) = prof::time(prof::Part::Pan, || self.pan_to(y)) {
             crate::logf!("ui: pan: {e}");
+        }
+        if !turned && self.pans_told < 1 {
+            self.pans_told += 1;
+            crate::logf!("ui: drew rows {first}..={last} at {y}, panned there: shown {}", self.pan());
         }
     }
 

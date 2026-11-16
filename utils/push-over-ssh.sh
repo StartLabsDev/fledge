@@ -202,12 +202,33 @@ stage() {
     [ "$(remote_hash "$2.unfr0zen-new")" = "$3" ] || { on "rm -f '$2.unfr0zen-new'"; fail "$2 did not arrive intact"; }
     on "chmod --reference='$2' '$2.unfr0zen-new' 2>/dev/null || chmod $4 '$2.unfr0zen-new'"
 }
-# swap DEST: keep DEST in /tmp, rename the staged file over it.
+# swap DEST: keep DEST, rename the staged file over it. The old one is kept
+# in the unit's /tmp, or on this computer (.work/push/rollback) where /tmp is
+# memory the unit can't spare: a gen 2's 58 MB, which a 15 MB copy starves
+# into restarting nlclient.
+small=$(on "awk '/^MemTotal:/ { print (\$2 < 131072) }' /proc/meminfo")
+rollback=$work/rollback
 swap() {
     name=$(basename -- "$1")
-    on "cp -p '$1' '/tmp/$name.unfr0zen-old' && mv -f '$1.unfr0zen-new' '$1' && sync"
+    if [ "$small" = 1 ]; then
+        mkdir -p "$rollback"
+        on "cat '$1'" > "$rollback/$name" && [ "$(hash "$rollback/$name")" = "$(remote_hash "$1")" ] ||
+            fail "could not keep a copy of $1 here; nothing was swapped"
+        on "mv -f '$1.unfr0zen-new' '$1' && sync"
+    else
+        on "cp -p '$1' '/tmp/$name.unfr0zen-old' && mv -f '$1.unfr0zen-new' '$1' && sync"
+    fi
 }
-restore() { on "mv -f '/tmp/$(basename -- "$1").unfr0zen-old' '$1' && sync"; }
+restore() {
+    name=$(basename -- "$1")
+    if [ "$small" = 1 ]; then
+        on "cat > '$1.unfr0zen-new'" < "$rollback/$name" &&
+            [ "$(remote_hash "$1.unfr0zen-new")" = "$(hash "$rollback/$name")" ] &&
+            on "chmod --reference='$1' '$1.unfr0zen-new' && mv -f '$1.unfr0zen-new' '$1' && sync"
+    else
+        on "mv -f '/tmp/$name.unfr0zen-old' '$1' && sync"
+    fi
+}
 pid_of() { on "pidof $1" || true; }
 # stays_up PROCESS SECONDS [OLD_PID]: a pid other than OLD_PID, the same one
 # alive for the last 10 of SECONDS: a process that never restarted is no proof.
