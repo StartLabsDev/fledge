@@ -1914,7 +1914,7 @@ impl Runtime {
                         self.input.press();
                         waiting = Instant::now();
                     }
-                    if waiting.elapsed() > Duration::from_millis(1500) {
+                    if waiting.elapsed() > Duration::from_millis(if pressed_again { 2500 } else { 1500 }) {
                         logf!("ui: nlclient's menu didn't show: left as it is");
                         return;
                     }
@@ -1936,7 +1936,11 @@ impl Runtime {
                 // known by its pixels at every item: up to a lap, one item at
                 // a time, stopping should its dial show.
                 let small = gen2::page(&self.display.save());
-                let steps: &[i32] = if told || small { &[40; MENU_ITEMS] } else { &[40] };
+                // The gen 2's optical ring counts about 4000 a turn: a gen 3
+                // item's turn (13 reports) can jump past Settings there, so
+                // a quarter of it at a time, up to a turn.
+                let (steps, reports): (&[i32], usize) = if small { (&[40; 32], 3) }
+                    else if told { (&[40; MENU_ITEMS], 13) } else { (&[40], 13) };
                 let mut chosen = settings_chosen(&self.display.save());
                 for (n, &step) in steps.iter().enumerate() {
                     if chosen {
@@ -1946,9 +1950,13 @@ impl Runtime {
                         logf!("ui: nlclient's menu went, {n} items turned: left as it is");
                         return;
                     }
-                    self.input.hand_turn(step, 13);
-                    std::thread::sleep(Duration::from_millis(450));
+                    self.input.hand_turn(step, reports);
+                    std::thread::sleep(Duration::from_millis(if small { 300 } else { 450 }));
                     chosen = settings_chosen(&self.display.save());
+                    if small {
+                        logf!("ui: nlclient's menu, turned {}: {}", (n + 1) * reports * 40,
+                              if chosen { "Settings" } else if back_chosen(&self.display.save()) { "Back" } else { "another item" });
+                    }
                 }
                 if chosen && (!told || menu_shows(&mut self.display)) && !(small && dial(&self.display.save())) {
                     self.input.press();
