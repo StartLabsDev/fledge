@@ -240,8 +240,8 @@ pub struct Display {
     shown: Frame,
     /// When the gen 2's nlclient was last seen drawing aside (recheck).
     checked: std::time::Instant,
-    /// Pans logged since begin, on the gen 2 (a few, to see them work).
-    pans_told: u8,
+    /// Pans in a row that didn't land, on the gen 2 (check_pan).
+    missed_pans: u8,
 }
 
 /// The two pages, as nlclient's EGL flips between them: which one shows,
@@ -295,7 +295,7 @@ impl Display {
             return Err(format!("/dev/fb0: mmap: {}", std::io::Error::last_os_error()));
         }
         Ok(Display { file, map: map.cast(), len, stride, side, turned: side == SIDE, flip: None,
-                     shown: vec![0; side * side * 4], checked: std::time::Instant::now(), pans_told: 0 })
+                     shown: vec![0; side * side * 4], checked: std::time::Instant::now(), missed_pans: 0 })
     }
 
     /// The panel's side in pixels.
@@ -397,10 +397,7 @@ impl Display {
             wake_display();
         }
         self.checked = std::time::Instant::now();
-        if !self.turned {
-            crate::logf!("ui: takes the display: pages {pages:?}, home {home}, shown {}", self.pan());
-            self.pans_told = 0;
-        }
+        self.missed_pans = 0;
     }
 
     /// On the gen 2: both pages to flip between once nlclient draws into
@@ -499,10 +496,28 @@ impl Display {
         if let Err(e) = prof::time(prof::Part::Pan, || self.pan_to(y)) {
             crate::logf!("ui: pan: {e}");
         }
-        if !turned && self.pans_told < 1 {
-            self.pans_told += 1;
-            crate::logf!("ui: drew rows {first}..={last} at {y}, panned there: shown {}", self.pan());
+        if !turned {
+            self.check_pan(y);
         }
+    }
+
+    /// On the gen 2: whether the pan to `y` landed. Twice in a row not, the
+    /// UI draws on the page that does show (and says so), rather than go on
+    /// drawing where nothing is seen: a blank display under a live ring.
+    fn check_pan(&mut self, y: usize) {
+        let shown = self.pan();
+        let give_up;
+        (self.missed_pans, give_up) = missed_pan(self.missed_pans, shown, y);
+        if !give_up {
+            return;
+        }
+        crate::logf!("ui: panned to {y} but {shown} shows, twice: drawing on {shown}");
+        if let Some(flip) = self.flip.as_mut() {
+            *flip = Flip { pages: [shown; 2], front: 0, home: 0, stale: [Some((0, self.side - 1)); 2] };
+        }
+        // Not flipping between both again until nlclient is seen drawing
+        // aside afresh (recheck), a little later.
+        self.checked = std::time::Instant::now() + Duration::from_secs(5);
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -544,6 +559,16 @@ impl Display {
         let (side, row) = (self.side, self.side * 4);
         let by = by.min(side);
         self.present(None, |y, line| line.copy_from_slice(slid(from, to, by, clockwise, side, row, y)));
+    }
+}
+
+/// Pans in a row that didn't land, after one to `y` with `shown` showing,
+/// and whether that is the second (counting starts again).
+fn missed_pan(missed: u8, shown: usize, y: usize) -> (u8, bool) {
+    match (shown == y, missed + 1) {
+        (true, _) => (0, false),
+        (false, 2..) => (0, true),
+        (false, n) => (n, false),
     }
 }
 
@@ -776,6 +801,14 @@ mod tests {
             }
             assert!(page == want, "rows {first}..={last}");
         }
+    }
+
+    #[test]
+    fn two_pans_in_a_row_that_dont_land_give_up_flipping() {
+        assert_eq!(missed_pan(0, 320, 320), (0, false), "landed");
+        assert_eq!(missed_pan(0, 320, 0), (1, false), "once may be a page still turning");
+        assert_eq!(missed_pan(1, 320, 0), (0, true), "twice: draw where it shows");
+        assert_eq!(missed_pan(1, 0, 0), (0, false), "a landing in between starts again");
     }
 
     #[test]

@@ -38,6 +38,21 @@ pub struct Fonts {
 }
 
 impl Fonts {
+    /// Fledge's own fonts standing in for the Nest's, which aren't in the
+    /// repository: for tests that draw (ui::shots::draw_times).
+    #[cfg(test)]
+    pub fn built_in() -> Fonts {
+        let font = |data: &'static [u8]| FontArc::try_from_slice(data).unwrap();
+        Fonts {
+            nest_regular: font(include_bytes!("fonts/DMSans-Regular.ttf")),
+            nest_medium: font(include_bytes!("fonts/DMSans-Medium.ttf")),
+            fledge_regular: font(include_bytes!("fonts/DMSans-Regular.ttf")),
+            fledge_medium: font(include_bytes!("fonts/DMSans-Medium.ttf")),
+            fledge_digits: font(include_bytes!("fonts/Outfit-ExtraLight.ttf")),
+            fledge_clock: font(include_bytes!("fonts/Outfit-Light.ttf")),
+        }
+    }
+
     pub fn load(dir: &str) -> Result<Fonts, String> {
         let load = |name: &str| -> Result<FontArc, String> {
             let path = format!("{dir}/{name}");

@@ -747,6 +747,40 @@ impl Bridge {
             });
         }
 
+        // How smooth the UI is in use (ui::Ui::frame_report): a minute's
+        // typical and slowest frame while it animates.
+        let frames = format!("{}/ui/frames", self.base);
+        for (key, name, field, icon) in [
+            ("ui_frame_typical", "Screen frame time", "typical", "mdi:timer-outline"),
+            ("ui_frame_slowest", "Slowest screen frame", "slowest", "mdi:timer-alert-outline"),
+        ] {
+            add("sensor", key, name, fields!{
+                "state_topic" => frames.clone(),
+                "value_template" => format!("{{{{ value_json.{field} }}}}"),
+                "unit_of_measurement" => "ms",
+                "device_class" => "duration",
+                "state_class" => "measurement",
+                "entity_category" => "diagnostic",
+                "icon" => icon,
+            });
+        }
+
+        // nlclient's restarts (nest_app.rs), on both generations.
+        let nest_app = format!("{}/nest_app", self.base);
+        add("sensor", "nest_app_restarts", "Nest app restarts (24 h)", fields!{
+            "state_topic" => nest_app.clone(),
+            "value_template" => "{{ value_json.restarts_day }}",
+            "state_class" => "measurement",
+            "entity_category" => "diagnostic",
+            "icon" => "mdi:restart",
+        });
+        add("binary_sensor", "nest_app_trouble", "Nest app restarting", fields!{
+            "state_topic" => nest_app,
+            "value_template" => "{{ 'ON' if value_json.trouble else 'OFF' }}",
+            "device_class" => "problem",
+            "entity_category" => "diagnostic",
+        });
+
         // The gen 2's memory (health.rs): what it has to spare is what its
         // cards and nlclient share.
         if crate::device::current().generation == 2 {
@@ -1207,6 +1241,14 @@ pub fn state(dev: &Fields, sh: &Fields) -> Fields {
 }
 
 /// The home screen cards' commands, to Home Assistant's nest_ui blueprint.
+impl crate::nest_app::Report for Bridge {
+    /// nlclient's restarts (nest_app.rs), on <base>/nest_app.
+    fn nest_app(&self, running: bool, restarts_day: usize, trouble: bool) {
+        let payload = serde_json::json!({"running": running, "restarts_day": restarts_day, "trouble": trouble}).to_string();
+        self.publish(&format!("{}/nest_app", self.base), true, payload.as_bytes());
+    }
+}
+
 impl crate::health::Report for Bridge {
     fn memory(&self, reading: &crate::health::Reading, faults: u64, level: crate::health::Level, paused: bool) {
         self.publish_memory(reading, faults, level, paused);
@@ -1214,6 +1256,11 @@ impl crate::health::Report for Bridge {
 }
 
 impl crate::ui::Sender for Bridge {
+    fn ui_frames(&self, slowest_ms: u32, typical_ms: f32) {
+        let payload = serde_json::json!({"slowest": slowest_ms, "typical": (typical_ms * 10.0).round() / 10.0}).to_string();
+        self.publish(&format!("{}/ui/frames", self.base), true, payload.as_bytes());
+    }
+
     fn send(&self, command: &crate::ui::Command) {
         let payload = command.payload().to_string();
         // An alarm's code is never logged.
@@ -1594,6 +1641,19 @@ pub mod tests {
             // The heating times read their own topic, the rest the state's.
             let (want, keys) = if c["state_topic"] == json!("nestlocal/S/heating_times") {
                 ("nestlocal/S/heating_times", schedule_keys.clone())
+            } else if c["state_topic"] == json!("nestlocal/S/ui/frames") {
+                let fields = match json!({"slowest": 30, "typical": 20.5}) {
+                    Value::Object(o) => o,
+                    _ => unreachable!(),
+                };
+                ("nestlocal/S/ui/frames", fields)
+            } else if c["state_topic"] == json!("nestlocal/S/nest_app") {
+                // nest_app.rs's, as Bridge::nest_app publishes it.
+                let fields = match json!({"running": true, "restarts_day": 0, "trouble": false}) {
+                    Value::Object(o) => o,
+                    _ => unreachable!(),
+                };
+                ("nestlocal/S/nest_app", fields)
             } else {
                 ("nestlocal/S/state", s.clone())
             };

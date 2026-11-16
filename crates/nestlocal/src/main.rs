@@ -20,6 +20,7 @@ mod liveness;
 mod logger;
 mod matter;
 mod motion;
+mod nest_app;
 mod mqtt;
 mod mqtttls;
 mod nlsettings;
@@ -283,6 +284,7 @@ async fn run(config: flags::Config) {
     }
     if let Some(bridge) = &bridge {
         health::start(bridge.clone());
+        nest_app::start(bridge.clone());
         ui::start(bridge.ui.clone(), bridge.clone());
     }
     if let (true, Some(bridge)) = (config.zigbee, &bridge) {

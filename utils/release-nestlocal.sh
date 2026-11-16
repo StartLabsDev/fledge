@@ -110,6 +110,12 @@ untag() { [ $published = 1 ] || git tag -d "$tag" > /dev/null 2>&1 || true; }
 trap untag EXIT
 
 # --- build -----------------------------------------------------------------------
+# The thermostats heat a home and aren't for testing on: what each screen
+# costs to draw is checked here against the baseline recorded on this Mac
+# (crates/nestlocal/src/testdata/draw-times.json; see ui::shots::draw_times).
+echo "Checking the screens' draw times (log: $log)"
+cargo test --release -p nestlocal ui::shots::draw_times -- --ignored --nocapture >> "$log" 2>&1 ||
+    { grep -E "slower to draw|panicked" "$log" | tail -n 3 >&2; fail "a screen draws much slower than before"; }
 echo "Building nestlocal (log: $log)"
 if [ "$(uname -s)" = Darwin ]; then
     docker build -q -t unfr0zen-build - < utils/ci/Dockerfile >> "$log" 2>&1 || { tail -n 20 "$log" >&2; fail "docker build"; }

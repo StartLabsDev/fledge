@@ -259,6 +259,9 @@ pub trait Sender: Send + Sync + 'static {
     /// Has nlclient commit its device bucket (a field of Fledge's own in
     /// it changed), which starts the patch's display keeper in it.
     fn nudge_nlclient(&self) {}
+    /// The last minute's frames while the UI drew: the slowest, and the
+    /// time a frame took on average, in ms.
+    fn ui_frames(&self, _slowest_ms: u32, _typical_ms: f32) {}
 }
 
 /// Kept while the thermostat shows Nest's own dial rather than its card.
@@ -506,6 +509,10 @@ struct Runtime {
     /// other all told, how many those were, and how many came later than
     /// the display's next refresh but one.
     paced: (Option<Instant>, Duration, u32, u32),
+    /// The animations' frames since this minute's report began (when it
+    /// began, how many, how long all told, the longest): Home Assistant's
+    /// frame sensors, once a minute while frames are drawn (frame_report).
+    minute: (Option<Instant>, u32, Duration, Duration),
 }
 
 /// What a card's frame shows: its card (none for Settings), whether a
@@ -648,7 +655,7 @@ impl Runtime {
             seen: (SEEN_FAR.load(std::sync::atomic::Ordering::Relaxed), SEEN_NEAR.load(std::sync::atomic::Ordering::Relaxed)),
             rest: false, black: false, beat: 0, last_beat: now,
             scratch: vec![0; (paint::side() * paint::side() * 4) as usize], sweep: None, live: None, ticker: None, last_frame: now,
-            last_check: now - Duration::from_secs(10), last_nudge: None, nlclient: false, elsewhere: false, frames: Default::default(), spent: Default::default(), paced: Default::default(),
+            last_check: now - Duration::from_secs(10), last_nudge: None, nlclient: false, elsewhere: false, frames: Default::default(), spent: Default::default(), paced: Default::default(), minute: Default::default(),
             pressed: None, back_chosen: None, back_since: None, native_input: now, settings_checked: now, settings_seen: 0, native_settings: false, native_off_dial: false,
             nest_checked: now - Duration::from_secs(10), pulse: None, next_pulse: now, glide: None, force_draw: false, last_click: now, cards_stale: false, home_from: None, set_words: false, volume_view: false, progress_drawn: now, fade_next: false, options_shown: None,
             recolour: None, stills: HashMap::new(), now_shown: (0.0, 0.0), now_side: 1.0,
@@ -1120,6 +1127,7 @@ impl Runtime {
                 // Only a movement with a frame that missed the display's
                 // 60 Hz: anything else is as it should be.
                 let (count, total, longest) = std::mem::take(&mut self.frames);
+                self.frame_report(count, total, longest, now);
                 let (all, worst) = std::mem::take(&mut self.spent);
                 let (_, span, gaps, late) = std::mem::take(&mut self.paced);
                 if longest > Duration::from_millis(17) || late * 10 > gaps {
@@ -1129,6 +1137,25 @@ impl Runtime {
                           longest.as_millis(), prof::describe(&worst, 1));
                 }
             }
+        }
+    }
+
+    /// Adds an animation's frames to this minute's, and a minute on, sends
+    /// Home Assistant the typical and the slowest: smoothness as it is in
+    /// use, with nothing run to measure it.
+    fn frame_report(&mut self, count: u32, total: Duration, longest: Duration, now: Instant) {
+        if count == 0 {
+            return;
+        }
+        let (since, n, all, worst) = &mut self.minute;
+        let started = *since.get_or_insert(now);
+        *n += count;
+        *all += total;
+        *worst = (*worst).max(longest);
+        if now.duration_since(started) >= Duration::from_secs(60) {
+            let typical = all.as_secs_f32() * 1000.0 / *n as f32;
+            self.sender.ui_frames(worst.as_millis() as u32, typical);
+            self.minute = Default::default();
         }
     }
 
@@ -3202,6 +3229,69 @@ mod shots {
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.write_header().unwrap().write_image_data(pixmap.data()).unwrap();
+    }
+
+    /// How long each main screen takes to draw, at the gen 3's and the gen
+    /// 2's size, against testdata/draw-times.json (recorded on the Mac that
+    /// makes releases): a screen more than DRAW_SLACK times slower fails. The
+    /// thermostats aren't for testing on (they heat a home), so a slip like
+    /// a face's glow worked out on every draw is caught here instead.
+    /// Release builds only, run by utils/release-nestlocal.sh:
+    /// `cargo test --release -p nestlocal ui::shots::draw_times -- --ignored`
+    /// (UNFR0ZEN_DRAW_TIMES_RECORD=1 records the baseline).
+    #[test]
+    #[ignore]
+    fn draw_times() {
+        const DRAW_SLACK: f64 = 2.5;
+        let fonts = paint::Fonts::built_in();
+        paint::set_theme(paint::Theme::Fledge);
+        let cards = Cards::parse(br#"{"cards":[
+            {"kind":"lights","name":"Bedroom","icon":"mdi:lightbulb-group","lights":[
+                {"id":"light.reading_lamp","name":"Reading Lamp","icon":"m3s:table-lamp","on":true,"dimmable":true,"brightness":60,"rgb":[255,169,87]},
+                {"id":"light.desk_lamp","name":"Desk Lamp","icon":"m3o:table-lamp","on":false,"dimmable":true,"brightness":null,"rgb":null}]},
+            {"kind":"climate","id":"climate.living","name":"Living room","icon":"","mode":"heat","action":"heating","target":21.5,"current":19.5,"min":7,"max":30,"step":0.5},
+            {"kind":"media","id":"media_player.kitchen","name":"Bedroom speaker","icon":"","state":"playing","title":"Sunday Morning Mix","artist":"Various artists","volume":35}]}"#).unwrap();
+        let [Card::Lights(lights), Card::Climate(climate), Card::Media(media)] = &cards.cards[..] else { panic!() };
+        let screens = || [
+            ("lights", Screen::LightsCard { card: lights }),
+            ("climate", Screen::NestCard { nest: Cow::Owned(Nest::of_card(climate)), now: 0.0 }),
+            ("climate-set", Screen::NestSet { nest: Cow::Owned(Nest::of_card(climate)), target: 22.0, pulse: None, setting: true, shown: None }),
+            ("media", Screen::MediaCard { card: media, volume: None, progress: Some(0.4) }),
+            ("settings", Screen::SettingsCard),
+            ("list", Screen::LightList { card: lights, selected: 0 }),
+            ("dim", Screen::LightDim { light: &lights.lights[0], on: true, value: 60 }),
+            ("volume", Screen::Volume { card: media, value: 35 }),
+        ];
+        let mut times = serde_json::Map::new();
+        for side in [480u32, 320] {
+            paint::preview_at(side);
+            for (name, screen) in screens() {
+                screens::draw(&fonts, &screen, None); // the face, cached
+                let runs = 100;
+                let started = std::time::Instant::now();
+                for _ in 0..runs {
+                    std::hint::black_box(screens::draw(&fonts, &screen, None));
+                }
+                let ms = started.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+                times.insert(format!("{name}@{side}"), serde_json::json!((ms * 100.0).round() / 100.0));
+            }
+        }
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata/draw-times.json");
+        if std::env::var_os("UNFR0ZEN_DRAW_TIMES_RECORD").is_some() {
+            std::fs::write(path, serde_json::to_string_pretty(&times).unwrap() + "\n").unwrap();
+            return;
+        }
+        let baseline: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut slow = Vec::new();
+        for (key, ms) in &times {
+            let (ms, was) = (ms.as_f64().unwrap(), baseline.get(key).and_then(|v| v.as_f64()).unwrap_or(f64::INFINITY));
+            println!("{key:>18}: {ms:6.2} ms (baseline {was:.2})");
+            // Below 0.05 ms, timing noise: not compared under that.
+            if ms > was.max(0.05) * DRAW_SLACK {
+                slow.push(format!("{key} {ms:.2} ms, was {was:.2}"));
+            }
+        }
+        assert!(slow.is_empty(), "more than {DRAW_SLACK}x slower to draw: {}", slow.join("; "));
     }
 
     #[test]
