@@ -24,7 +24,8 @@
 # the tag as its version (git describe), and built in the firmware build image
 # on macOS, as utils/build-firmware.sh does (it needs one full build first).
 # The release holds nestlocal-armv7, nestlocal-armv7.sig (a raw 64-byte
-# Ed25519 signature of the file) and nestlocal-armv7.sha256. Publishing pushes
+# Ed25519 signature of the file) and nestlocal-armv7.sha256, and nestlocal.gen2
+# where it runs a gen 2's cards (a gen 2 is offered no other). Publishing pushes
 # the tag to origin and creates the release with gh as GitHub's active
 # account, marked latest. Needs OpenSSL 3 (brew install openssl@3).
 set -eu
@@ -161,7 +162,15 @@ case $tag in
     *-rc.*|*-beta.*|*-alpha.*) channel=--prerelease ;;
     *) channel=--latest ;;
 esac
+# A gen 2 is offered only releases holding nestlocal.gen2 (update.rs): those
+# built with its cards and memory watch (crates/nestlocal/src/health.rs).
+gen2=
+if [ -f crates/nestlocal/src/health.rs ]; then
+    gen2=$out/nestlocal.gen2
+    echo "This release's nestlocal runs a 2nd generation Nest's cards." > "$gen2"
+fi
+# shellcheck disable=SC2086
 gh release create "$tag" --repo "$repo" --verify-tag "$channel" --title "Fledge $tag" \
-    --notes-file "$out/notes.md" "$binary" "$binary.sig" "$binary.sha256" ||
+    --notes-file "$out/notes.md" "$binary" "$binary.sig" "$binary.sha256" $gen2 ||
     fail "the tag is pushed but the release was not created: gh release create $tag --repo $repo ..."
 echo "Released: https://github.com/$repo/releases/tag/$tag"

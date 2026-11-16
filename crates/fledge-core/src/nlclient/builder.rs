@@ -69,6 +69,9 @@ pub fn build(source: &[u8], object: &[u8]) -> Result<Built> {
         externals.entry(key.into()).or_insert(0);
     }
     externals.insert("layout_HANDOVER".into(), handover as u32);
+    for key in super::discovery::FB_LAYOUT {
+        externals.insert(format!("layout_{key}"), 0);
+    }
     externals.extend(
         discovery
             .layout

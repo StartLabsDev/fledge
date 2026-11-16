@@ -144,9 +144,6 @@ impl PatchInputs {
         if self.matter_thread && (!matter || self.zigbee) {
             return Err(failure("Matter over Thread requires Matter and cannot share the radio with Zigbee"));
         }
-        if self.wwn_boiler && !self.zigbee && !self.matter_thread {
-            return Err(failure("--wwn-boiler is for a radio nestlocal holds: it needs --zigbee or --matter-thread"));
-        }
         if self.external_temperature && self.mqtt.is_none() && !matter && !self.zigbee {
             return Err(failure("--external-temperature takes its readings over --mqtt, --matter or --zigbee"));
         }
@@ -401,16 +398,14 @@ mod describe_tests {
     }
 
     #[test]
-    fn the_boiler_option_needs_a_radio_nestlocal_holds() {
+    fn the_boiler_option_needs_no_radio() {
+        // rcS sets it before nlclient starts: a Nest with no Heat Link needs
+        // neither Zigbee nor Thread to heat through W1.
         let alone = PatchInputs { wwn_boiler: true, ..PatchInputs::default() };
-        assert!(alone.build().err().unwrap().to_string().contains("--wwn-boiler"));
-        let mqtt = PatchInputs { mqtt: Some("broker".into()), ..alone.clone() };
-        assert!(mqtt.build().is_err(), "MQTT leaves the radio to Nest");
-        let zigbee = PatchInputs { zigbee: true, ..alone.clone() };
-        assert!(zigbee.build().unwrap().wwn_boiler);
+        assert!(alone.build().unwrap().wwn_boiler);
+        assert_eq!(alone.describe(), "--wwn-boiler");
+        let zigbee = PatchInputs { zigbee: true, ..alone };
         assert_eq!(zigbee.describe(), "--zigbee --wwn-boiler");
-        let thread = PatchInputs { matter: true, matter_thread: true, ..alone };
-        assert!(thread.build().unwrap().wwn_boiler);
         assert!(!PatchInputs { zigbee: true, ..PatchInputs::default() }.build().unwrap().wwn_boiler, "off unless asked");
     }
 

@@ -35,6 +35,10 @@ const HANDOVER_IMPORTS: [(&str, &str); 8] = [
 /// start.
 const FB_PRESENT: &str = "native_fb_present";
 const PR_CREATE_THREAD: &str = "native_pr_create_thread";
+/// mmap, for custom_present's private mapping (framebuffer_fields).
+const FB_MMAP: &str = "native_mmap";
+/// The fields framebuffer_fields finds, 0 in a build without them.
+pub const FB_LAYOUT: [&str; 3] = ["FB_FD_OFFSET", "FB_MAP_OFFSET", "FB_SIZE_OFFSET"];
 /// Whether nlclient has all the screen hand-over needs: a present to wrap
 /// (eglSwapBuffers, or the gen 2's framebuffer present), a way to start the
 /// keeper's thread (pthread_create, or NSPR's), and the rest of
@@ -50,7 +54,7 @@ pub fn handover(api: &BTreeMap<String, u32>) -> bool {
 
 /// The hand-over's natives, for linking a build without them: never called.
 pub fn handover_keys() -> impl Iterator<Item = &'static str> {
-    HANDOVER_IMPORTS.iter().map(|(key, _)| *key).chain([FB_PRESENT, PR_CREATE_THREAD])
+    HANDOVER_IMPORTS.iter().map(|(key, _)| *key).chain([FB_PRESENT, PR_CREATE_THREAD, FB_MMAP])
 }
 
 /// The one call that presents nlclient's frames: a BL to eglSwapBuffers's
@@ -110,6 +114,56 @@ fn present_slot(elf: &Elf, ioctl: u32) -> Result<(u32, u32)> {
         }
     }
     Ok((method, unique(slots, "present method slots")?))
+}
+/// The present's object (the gen 2's nlARMFramebuffer): its init, the
+/// method two slots before the present, maps fb0 with
+/// `mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)` and stores the
+/// address. The fields that hold fb0's descriptor, the mapping's address and
+/// its length (as unfr0zen's custom_flip finds them).
+fn framebuffer_fields(elf: &Elf, arm: &Arm, imports: &BTreeMap<String, u32>, slot: u32) -> Result<[(&'static str, u32); 3]> {
+    require(half(elf.data, 16)? == 2, "framebuffer mapping needs an EXEC build")?;
+    let mmap = *imports.get("mmap").ok_or_else(|| crate::Error::Device("framebuffer mapping needs mmap".into()))?;
+    let init = elf.read(slot - 8)?;
+    let target = |i: &Ins| i.ops.first().and_then(Op::imm);
+    let code = arm.code(init, None)?;
+    let call = unique(
+        code.iter().enumerate().filter(|(_, i)| i.name == "bl" && target(i) == Some(mmap)).map(|(n, _)| n),
+        "framebuffer mmap call",
+    )?;
+    // A store of `reg` into the object (the base register `this` is in).
+    let field = |i: &Ins, reg: &str| -> Option<(String, u32)> {
+        let (base, disp, indexed) = i.ops.get(1)?.mem()?;
+        (i.name == "str" && i.ops.first()?.reg() == Some(reg) && base != "sp" && !indexed && disp > 0)
+            .then(|| (base.to_owned(), disp as u32))
+    };
+    let (this, map) = code[call + 1..code.len().min(call + 5)]
+        .iter()
+        .find_map(|i| field(i, "r0"))
+        .ok_or_else(|| crate::Error::Device("framebuffer mapping not stored".into()))?;
+    let before = &code[call.saturating_sub(12)..call];
+    let size = before
+        .iter()
+        .rev()
+        .find_map(|i| field(i, "r1").filter(|(b, _)| *b == this))
+        .ok_or_else(|| crate::Error::Device("framebuffer mapping length not stored".into()))?
+        .1;
+    // The fifth argument, fb0's descriptor, goes on the stack from a field.
+    let stacked = before
+        .iter()
+        .rev()
+        .find(|i| i.name == "str" && i.ops.get(1).and_then(Op::mem) == Some(("sp", 0, false)))
+        .and_then(|i| i.ops.first()?.reg())
+        .ok_or_else(|| crate::Error::Device("framebuffer descriptor not passed".into()))?;
+    let fd = before
+        .iter()
+        .rev()
+        .find_map(|i| {
+            let (base, disp, indexed) = i.ops.get(1)?.mem()?;
+            (i.name == "ldr" && i.ops.first()?.reg() == Some(stacked) && base == this && !indexed)
+                .then_some(disp as u32)
+        })
+        .ok_or_else(|| crate::Error::Device("framebuffer descriptor field not found".into()))?;
+    Ok([("FB_FD_OFFSET", fd), ("FB_MAP_OFFSET", map), ("FB_SIZE_OFFSET", size)])
 }
 /// nlclient's report of what its display shows: the one function that logs
 /// the UiDisplayChange telemetry event, taking what changed (its screen, its
@@ -717,6 +771,16 @@ pub fn survey(data: &[u8]) -> Result<(Discovery, Option<String>)> {
         api.insert(FB_PRESENT.to_owned(), method);
         if handover(&api) {
             anchors.insert("present_slot".into(), slot);
+            // Where the present's object keeps fb0's mapping: while the UI
+            // owns the display, custom_present maps private memory over it,
+            // so nlclient draws unseen and the UI has both pages to flip.
+            // Without it the UI keeps to the page shown (FB_MAP_OFFSET 0).
+            if let Ok(fields) = framebuffer_fields(&elf, &arm, &imports, slot) {
+                api.insert(FB_MMAP.to_owned(), imports["mmap"]);
+                for (key, value) in fields {
+                    layout.insert(key.into(), value);
+                }
+            }
         } else {
             api.remove(FB_PRESENT);
         }

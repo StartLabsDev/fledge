@@ -1546,6 +1546,22 @@ pub fn dots(canvas: &mut Canvas, count: usize, active: usize, y: f32, fade: f32)
     }
 }
 
+/// The chooser's dots over a full-size card, on a frame for the panel
+/// (device::Frame), where the cards don't zoom out (the gen 2): low on the
+/// display, on a dark band so they show over any card.
+pub fn chooser_dots(frame: &mut Vec<u8>, count: usize, active: usize) {
+    if count < 2 {
+        return;
+    }
+    let Some(mut canvas) = panel_canvas(frame) else { return };
+    let width = 15.0 * (count - 1) as f32 + 36.0;
+    pill(&mut canvas, CENTRE - width / 2.0, CHOOSER_DOTS_AT - 11.0, width, 22.0, Color::from_rgba8(0, 0, 0, 150));
+    dots(&mut canvas, count, active, CHOOSER_DOTS_AT, 1.0);
+    *frame = canvas.pixmap.take();
+}
+/// Where chooser_dots go: as low as the round display is wide enough.
+const CHOOSER_DOTS_AT: f32 = 438.0;
+
 /// The chosen card's name above the zoomed-out cards (their tops at 91),
 /// where the display is wide enough for a long one, and the dots below.
 const TITLE_BASELINE: f32 = 68.0;

@@ -1028,13 +1028,14 @@ impl Runtime {
                         *sum += part;
                     }
                     self.frames = (self.frames.0 + 1, self.frames.1 + took, self.frames.2.max(took));
-                    // The gen 2 leaves its core to the rest at least as long
-                    // as a frame took (device::favour).
+                    // The gen 2 leaves its core to the rest for half as long
+                    // as a frame took (device::favour): nlclient, drawing
+                    // aside, waits 100 ms a frame meanwhile (custom_present).
                     if crate::device::current().generation == 2 {
-                        // Twice as long while its memory is tight: nlclient
-                        // is reading its pages back.
+                        // Twice as long as the frame while its memory is
+                        // tight: nlclient is reading its pages back.
                         let tight = crate::health::level() != crate::health::Level::Calm;
-                        std::thread::sleep(if tight { took * 2 } else { took });
+                        std::thread::sleep(if tight { took * 2 } else { took / 2 });
                     }
                     let shown = Instant::now();
                     if let Some(gap) = self.paced.0.map(|last| shown.duration_since(last)).filter(|gap| *gap < LULL) {
@@ -1395,27 +1396,59 @@ impl Runtime {
         let part = at - whole;
         let (left, right) = (whole as i64, whole as i64 + 1);
         let count = self.machine.deck().len() as i64;
+        // Where the cards can't zoom out (the gen 2), the dots say it's the
+        // chooser: under the cards as they slide, the nearest one lit.
+        let cue = self.chooser_cue().then(|| (count as usize, at.round().clamp(0.0, count as f32 - 1.0) as usize));
         if left < 0 || right >= count {
             // Past an end: only the end card.
             let frame = self.card_frame(at.round().clamp(0.0, count as f32 - 1.0) as i64);
-            self.display.show(&frame);
-            return;
+            return self.show_card(&frame, cue);
         }
         self.prepare(left);
         if part < 0.001 {
             let frame = self.card_frame(left);
-            self.display.show(&frame);
-            return;
+            return self.show_card(&frame, cue);
         }
         self.prepare(right);
         let (from, to) = (self.key(left), self.key(right));
+        let by = (part * paint::side() as f32) as usize;
         let (cards, home) = (&self.cards, &self.home);
         let get = |key: usize| match key {
             0 => home.as_deref(),
             key => cards.get(&key).map(Vec::as_slice),
         };
         if let (Some(from), Some(to)) = (get(from), get(to)) {
-            self.display.slide(from, to, (part * paint::side() as f32) as usize, true);
+            match cue {
+                Some((count, active)) => {
+                    let scratch = &mut self.scratch;
+                    scratch.resize(from.len(), 0);
+                    prof::time(prof::Part::Compose, || device::slide_into(scratch, from, to, by, true));
+                    prof::time(prof::Part::Overlay, || paint::chooser_dots(scratch, count, active));
+                    self.display.show(scratch);
+                }
+                None => self.display.slide(from, to, by, true),
+            }
+        }
+    }
+
+    /// One card, full size, with the chooser's dots over it if `cue` says
+    /// (count, active).
+    fn show_card(&mut self, frame: &[u8], cue: Option<(usize, usize)>) {
+        let Some((count, active)) = cue else { return self.display.show(frame) };
+        self.scratch.clear();
+        self.scratch.extend_from_slice(frame);
+        prof::time(prof::Part::Overlay, || paint::chooser_dots(&mut self.scratch, count, active));
+        self.display.show(&self.scratch);
+    }
+
+    /// Whether the chooser shows its dots over full-size cards: where the
+    /// cards don't zoom out (full_size_only), as they would to show it's
+    /// the chooser.
+    fn chooser_cue(&self) -> bool {
+        full_size_only() && match self.machine.mode {
+            Mode::Chooser(_) => true,
+            Mode::Home => self.machine.owns(),
+            _ => false,
         }
     }
 
@@ -1782,11 +1815,13 @@ impl Runtime {
                 self.view = None;
                 let native = self.machine.mode == Mode::Native;
                 device::own(false);
-                if native {
+                if native || crate::device::current().generation == 2 {
                     // nlclient's frame as it was when we took the display: it
                     // drew since, unseen, and draws again only as something
                     // changes. Woken as Home Assistant wakes it (no input), it
-                    // draws what it shows now.
+                    // draws what it shows now. On the gen 2 that present is
+                    // also when what it drew aside goes back on fb0
+                    // (custom_present): woken whatever it shows.
                     device::wake_display();
                 }
             }
@@ -2839,6 +2874,24 @@ fn gen3_page(page: &[u8]) -> bool {
     page.len() == 480 * 480 * 4
 }
 
+/// A gen 2's frame of nlclient's (320 pixels across) scaled up to the gen
+/// 3's 480, where the checks of what nlclient shows were made: its screens
+/// are laid out the same, smaller. Any other frame as it is.
+fn as_gen3(page: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    const SMALL: usize = 320;
+    if page.len() != SMALL * SMALL * 4 {
+        return std::borrow::Cow::Borrowed(page);
+    }
+    let mut big = vec![0u8; 480 * 480 * 4];
+    for (y, line) in big.as_chunks_mut::<{ 480 * 4 }>().0.iter_mut().enumerate() {
+        let from = &page[y * SMALL / 480 * SMALL * 4..][..SMALL * 4];
+        for (x, pixel) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            pixel.copy_from_slice(&from[x * SMALL / 480 * 4..][..4]);
+        }
+    }
+    std::borrow::Cow::Owned(big)
+}
+
 fn dial_page(page: &[u8]) -> bool {
     dial(page) && nlstate::read().is_none_or(|report| report.shows() == Shows::Dial)
 }
@@ -2862,6 +2915,7 @@ fn menu_shows(display: &mut device::Display) -> bool {
 /// middle, black near the edge above and below it (a cooling dial is blue
 /// all over).
 fn settings_tile(page: &[u8]) -> bool {
+    let page = &*as_gen3(page);
     if !gen3_page(page) {
         return false;
     }
@@ -2896,6 +2950,7 @@ fn settings_tile(page: &[u8]) -> bool {
 /// Whether nlclient's menu shows with Back chosen: its arrow, lower left,
 /// blue (unchosen it is grey).
 fn back_chosen(page: &[u8]) -> bool {
+    let page = &*as_gen3(page);
     if !gen3_page(page) {
         return false;
     }
@@ -2915,6 +2970,7 @@ fn back_chosen(page: &[u8]) -> bool {
 /// Whether nlclient's menu shows Settings chosen: its cog, below the
 /// date, lit white.
 fn settings_chosen(page: &[u8]) -> bool {
+    let page = &*as_gen3(page);
     if !gen3_page(page) {
         return false;
     }
@@ -2937,6 +2993,7 @@ fn blank(page: &[u8]) -> bool {
 
 /// Whether a frame shows nlclient's home dial: its ring lit around the edge.
 fn dial(page: &[u8]) -> bool {
+    let page = &*as_gen3(page);
     if !gen3_page(page) {
         return false;
     }
@@ -2962,6 +3019,7 @@ fn dial(page: &[u8]) -> bool {
 /// middle, and nothing else white (its menus have white icons round the
 /// edge, its Settings tiles are blue).
 fn off_dial(page: &[u8]) -> bool {
+    let page = &*as_gen3(page);
     if !gen3_page(page) {
         return false;
     }

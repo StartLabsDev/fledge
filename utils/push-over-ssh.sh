@@ -272,6 +272,11 @@ if [ $nestlocal = 1 ]; then
         on "rm -f /etc/nestlocal/update.pending /etc/nestlocal/update.failed && sync"
         say "nestlocal: restarting"
         old=$(pid_of nestlocal)
+        # The hold above is nestlocal's own, gone while it restarts: a gen 2
+        # sleeps in that gap and drops the session. A second nestlocal holds
+        # the unit awake meanwhile (its own nlsleepd entity, as nestlocal.init
+        # does while trying an update), started detached so it outlives SSH.
+        on '(setsid /nestlabs/sbin/nestlocal -syslog -hold-awake 90s < /dev/null > /dev/null 2>&1 &)'
         on 'monit restart nestlocal'
         if stays_up nestlocal 40 "$old"; then
             say "nestlocal: running the new build"
