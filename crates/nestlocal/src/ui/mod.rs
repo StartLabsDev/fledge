@@ -445,6 +445,9 @@ struct Runtime {
     /// nlclient's Settings seen since its thermostat was opened from the
     /// cards (as nlclient tells it): its dial next is Done, back to the cards.
     native_settings: bool,
+    /// In nlclient's screens for its Settings, it has shown something other
+    /// than its dial (the gen 2's, opened by hand, start on it).
+    native_off_dial: bool,
     /// When the thermostat's own state was last asked for.
     nest_checked: Instant,
     /// The thermostat's dial: when its pulse (from now to the target) began,
@@ -646,7 +649,7 @@ impl Runtime {
             rest: false, black: false, beat: 0, last_beat: now,
             scratch: vec![0; (paint::side() * paint::side() * 4) as usize], sweep: None, live: None, ticker: None, last_frame: now,
             last_check: now - Duration::from_secs(10), last_nudge: None, nlclient: false, elsewhere: false, frames: Default::default(), spent: Default::default(), paced: Default::default(),
-            pressed: None, back_chosen: None, back_since: None, native_input: now, settings_checked: now, settings_seen: 0, native_settings: false,
+            pressed: None, back_chosen: None, back_since: None, native_input: now, settings_checked: now, settings_seen: 0, native_settings: false, native_off_dial: false,
             nest_checked: now - Duration::from_secs(10), pulse: None, next_pulse: now, glide: None, force_draw: false, last_click: now, cards_stale: false, home_from: None, set_words: false, volume_view: false, progress_drawn: now, fade_next: false, options_shown: None,
             recolour: None, stills: HashMap::new(), now_shown: (0.0, 0.0), now_side: 1.0,
             dial: None, last_dial: now - Duration::from_secs(60), count: None, press_lit: false,
@@ -854,7 +857,11 @@ impl Runtime {
                     }
                     None if self.machine.settings_open => {
                         let page = self.display.save();
-                        (dial(&page) && !settings_tile(&page)).then_some(self.settings_seen + 1)
+                        let on_dial = dial(&page) && !settings_tile(&page);
+                        // The gen 2's starts on its dial (opened by hand):
+                        // left only once it has been somewhere else.
+                        self.native_off_dial |= !on_dial;
+                        (on_dial && (self.native_off_dial || !gen2::page(&page))).then_some(self.settings_seen + 1)
                     }
                     None => None,
                 };
@@ -927,6 +934,14 @@ impl Runtime {
             if matches!(before, Mode::Chooser(_)) && !matches!(self.machine.mode, Mode::Chooser(_) | Mode::Home) {
                 // Opened: into the card before what it opens shows.
                 self.zoom_in();
+            }
+            if crate::device::current().generation == 2 && effects.contains(&Effect::OpenNestSettings) {
+                // The gen 2's nlclient takes no press of ours: say what to
+                // do on its dial, over the UI's last frame, before it shows.
+                let mut frame = self.display.current();
+                paint::hint(&mut frame, &self.fonts, "Press, then choose Settings");
+                self.display.show(&frame);
+                std::thread::sleep(Duration::from_millis(1800));
             }
             for effect in effects {
                 self.apply(effect);
@@ -1901,34 +1916,25 @@ impl Runtime {
                 self.force_draw = true;
             }
             Effect::OpenNestSettings => {
+                self.native_off_dial = false;
+                self.native_input = Instant::now();
+                self.settings_seen = 0;
+                if crate::device::current().generation == 2 {
+                    // Its nlclient takes no injected press (tested on Ben's
+                    // unit, 2026-11-16): its dial, for the hand to open its
+                    // menu and Settings (the hint said so), and to stay
+                    // until its Settings are left.
+                    logf!("ui: nlclient's dial, for its Settings by hand");
+                    return;
+                }
                 // Its menu, then on to Settings: each step only once the
                 // display shows the one before, so a turn only ever moves
                 // the menu, never the temperature. Else the menu stays.
                 std::thread::sleep(Duration::from_millis(300));
                 self.input.press();
-                let mut waiting = Instant::now();
-                // The gen 2's nlclient may take that press only to wake its
-                // display (the UI held it at rest): its dial shows, and a
-                // second press, on the dial, opens the menu.
-                // While it wakes it may not take a press at all: up to two
-                // more, each once its dial has shown for a second.
-                let small = gen2::page(&self.display.save());
-                let (mut presses, mut dial_since) = (1, None::<Instant>);
-                let started = Instant::now();
+                let waiting = Instant::now();
                 while !menu_shows(&mut self.display) {
-                    if small {
-                        let shows = dial(&self.display.save());
-                        dial_since = if shows { dial_since.or(Some(Instant::now())) } else { None };
-                        if presses < 3 && dial_since.is_some_and(|since| since.elapsed() > Duration::from_millis(1000)) {
-                            presses += 1;
-                            logf!("ui: nlclient's dial, not its menu: pressing again ({presses})");
-                            self.input.press();
-                            dial_since = None;
-                            waiting = Instant::now();
-                        }
-                    }
-                    let limit = if small { started.elapsed() > Duration::from_millis(7000) } else { waiting.elapsed() > Duration::from_millis(1500) };
-                    if limit {
+                    if waiting.elapsed() > Duration::from_millis(1500) {
                         logf!("ui: nlclient's menu didn't show: left as it is");
                         return;
                     }
@@ -1946,33 +1952,21 @@ impl Runtime {
                 // (checked above by its pixels): one item, as before.
                 std::thread::sleep(Duration::from_millis(600));
                 let told = nlstate::read().is_some();
-                // The gen 2's menu (a row of items, Settings beside Back) is
-                // known by its pixels at every item: up to a lap, one item at
-                // a time, stopping should its dial show.
-                let small = gen2::page(&self.display.save());
-                // The gen 2's optical ring counts about 4000 a turn: a gen 3
-                // item's turn (13 reports) can jump past Settings there, so
-                // a quarter of it at a time, up to a turn.
-                let (steps, reports): (&[i32], usize) = if small { (&[40; 32], 3) }
-                    else if told { (&[40; MENU_ITEMS], 13) } else { (&[40], 13) };
+                let steps: &[i32] = if told { &[40; MENU_ITEMS] } else { &[40] };
                 let mut chosen = settings_chosen(&self.display.save());
                 for (n, &step) in steps.iter().enumerate() {
                     if chosen {
                         break;
                     }
-                    if told && !menu_shows(&mut self.display) || small && dial(&self.display.save()) {
+                    if told && !menu_shows(&mut self.display) {
                         logf!("ui: nlclient's menu went, {n} items turned: left as it is");
                         return;
                     }
-                    self.input.hand_turn(step, reports);
-                    std::thread::sleep(Duration::from_millis(if small { 300 } else { 450 }));
+                    self.input.hand_turn(step, 13);
+                    std::thread::sleep(Duration::from_millis(450));
                     chosen = settings_chosen(&self.display.save());
-                    if small {
-                        logf!("ui: nlclient's menu, turned {}: {}", (n + 1) * reports * 40,
-                              if chosen { "Settings" } else if back_chosen(&self.display.save()) { "Back" } else { "another item" });
-                    }
                 }
-                if chosen && (!told || menu_shows(&mut self.display)) && !(small && dial(&self.display.save())) {
+                if chosen && (!told || menu_shows(&mut self.display)) {
                     self.input.press();
                     self.native_input = Instant::now();
                     self.settings_seen = 0;
