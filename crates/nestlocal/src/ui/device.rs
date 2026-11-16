@@ -257,9 +257,6 @@ struct Flip {
 const FBIOGET_VSCREENINFO: libc::c_ulong = 0x4600;
 const CAPTURE_REQUEST: &str = "/var/run/unfr0zen/capture.request";
 const FBIOPAN_DISPLAY: libc::c_ulong = 0x4606;
-/// Panel rows turned at a time on the gen 2 (Display::put): 16 rows of 320
-/// pixels, 20 KB, stay in its 32 KB data cache.
-const TURN_BAND: usize = 16;
 
 fn union(a: Option<(usize, usize)>, b: Option<(usize, usize)>) -> Option<(usize, usize)> {
     match (a, b) {
@@ -317,29 +314,7 @@ impl Display {
             }
             return;
         }
-        // The panel's pixel (x, y) is the frame's row x, column side - 1 - y:
-        // for one x, panel rows y.. are frame pixels running back along row
-        // x. Done a band of TURN_BAND panel rows at a time, so each frame row
-        // is read a run at a time (not a pixel per cache line), into lines
-        // that stay in the cache, each panel row's run then written whole
-        // (the display's memory is slow a pixel at a time).
-        let mut band = vec![0u8; TURN_BAND * row];
-        for top in (0..side).step_by(TURN_BAND) {
-            let rows = TURN_BAND.min(side - top);
-            for x in first..=last {
-                // Frame row x, columns side - top - rows ..= side - 1 - top.
-                let start = x * row + (side - top - rows) * 4;
-                let run = &frame[start..start + rows * 4];
-                for (n, pixel) in run.as_chunks::<4>().0.iter().rev().enumerate() {
-                    band[n * row + x * 4..n * row + x * 4 + 4].copy_from_slice(pixel);
-                }
-            }
-            for n in 0..rows {
-                let y = top + n;
-                page[y * stride + first * 4..y * stride + (last + 1) * 4]
-                    .copy_from_slice(&band[n * row + first * 4..n * row + (last + 1) * 4]);
-            }
-        }
+        fledge_pixels::turn::back(page, stride, side, frame, first, last);
     }
 
     /// A page as a Frame, from a copy read in whole rows (its memory is slow
@@ -593,20 +568,12 @@ pub fn slide_into(out: &mut [u8], from: &[u8], to: &[u8], by: usize, clockwise: 
 impl Display {
     /// `to` over `from` at `alpha` of 256.
     pub fn fade(&mut self, from: &[u8], to: &[u8], alpha: u16) {
-        let alpha = alpha.min(256) as u32;
         let row = self.side * 4;
         let mut blended = vec![0u8; row];
         self.present(None, |y, line| {
-            let (a, b) = (&from[y * row..(y + 1) * row], &to[y * row..(y + 1) * row]);
-            // A pixel at a time, two channels to a multiply (blue and red,
-            // then green and the unused byte), into a line written to the
-            // framebuffer whole: its memory is slow a byte at a time.
-            for ((out, a), b) in blended.as_chunks_mut::<4>().0.iter_mut().zip(a.as_chunks::<4>().0).zip(b.as_chunks::<4>().0) {
-                let (a, b) = (u32::from_le_bytes(*a), u32::from_le_bytes(*b));
-                let even = ((a & 0x00ff_00ff) * (256 - alpha) + (b & 0x00ff_00ff) * alpha) >> 8 & 0x00ff_00ff;
-                let odd = (((a >> 8) & 0x00ff_00ff) * (256 - alpha) + ((b >> 8) & 0x00ff_00ff) * alpha) & 0xff00_ff00;
-                *out = (even | odd).to_le_bytes();
-            }
+            // Into a line written to the framebuffer whole: its memory is
+            // slow a byte at a time.
+            fledge_pixels::blend::mix(&mut blended, &from[y * row..(y + 1) * row], &to[y * row..(y + 1) * row], alpha);
             line.copy_from_slice(&blended);
         });
     }

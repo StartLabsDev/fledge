@@ -124,6 +124,13 @@ binary=$out/nestlocal-armv7
 cp build/nestlocal-armv7 "$binary"
 grep -a -q -- "nestlocal/$tag" "$binary" || grep -a -q -- "$tag" "$binary" || fail "the build does not report $tag"
 ! grep -a -q -- "$tag-dirty" "$binary" || fail "the build reports $tag-dirty"
+# A gen 2's root slot (47 MB, about 22 MB of it nestlocal's to use) holds the
+# running nestlocal, kept for rollback, beside the update and 1 MB to spare
+# (update.rs): an update larger than this could not be installed there.
+max_bytes=9961472
+size=$(wc -c < "$binary" | tr -d ' ')
+[ "$size" -le $max_bytes ] ||
+    fail "nestlocal is $size bytes, over the $max_bytes a 2nd generation Nest can install (Cargo.toml's thermostat profile)"
 
 # --- sign --------------------------------------------------------------------------
 "$openssl" pkeyutl -sign -rawin -inkey "$key" -in "$binary" -out "$binary.sig"
