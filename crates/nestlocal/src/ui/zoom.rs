@@ -269,7 +269,10 @@ pub fn focus(out: &mut [u8], at: f32, z: f32, accent: Option<[u8; 3]>) {
     let [red, green, blue] = accent.unwrap_or(RIM);
     let colour = [blue as f32, green as f32, red as f32];
     let centre = middle + (k - at) * gap;
-    let (radius, halo) = (half - 1.0, HALO * k_px);
+    // The gen 2's core does floating point slowly: its rim has no glow,
+    // which cost it 30 ms a frame, the rim alone a band a few pixels wide.
+    let glows = crate::device::current().generation != 2;
+    let (radius, halo) = (half - 1.0, if glows { HALO * k_px } else { 2.0 });
     let reach = radius + halo;
     let (low, high) = (((centre - reach).floor().max(0.0)) as usize, ((centre + reach).ceil() as usize).min(side));
     let pixels = out.as_chunks_mut::<4>().0;
@@ -286,7 +289,7 @@ pub fn focus(out: &mut [u8], at: f32, z: f32, accent: Option<[u8; 3]>) {
                 let dy = c as f32 + 0.5 - middle;
                 let d = (dx * dx + dy * dy).sqrt();
                 let rim = (1.0 - (d - radius).abs() / 1.6).clamp(0.0, 1.0) * 0.85;
-                let glow = if d > radius { (1.0 - (d - radius) / halo).clamp(0.0, 1.0).powi(2) * 0.38 } else { 0.0 };
+                let glow = if glows && d > radius { (1.0 - (d - radius) / halo).clamp(0.0, 1.0).powi(2) * 0.38 } else { 0.0 };
                 let (rim, glow) = (rim * strength, glow * strength);
                 if rim <= 0.0 && glow <= 0.0 {
                     continue;

@@ -1036,14 +1036,15 @@ impl Runtime {
                         *sum += part;
                     }
                     self.frames = (self.frames.0 + 1, self.frames.1 + took, self.frames.2.max(took));
-                    // The gen 2 leaves its core to the rest for half as long
-                    // as a frame took (device::favour): nlclient, drawing
-                    // aside, waits 100 ms a frame meanwhile (custom_present).
+                    // The gen 2 leaves its core to the rest after each frame
+                    // (device::favour): a quarter as long as it took, at least
+                    // 4 ms; nlclient, drawing aside, waits 100 ms a frame
+                    // meanwhile (custom_present).
                     if crate::device::current().generation == 2 {
                         // Twice as long as the frame while its memory is
                         // tight: nlclient is reading its pages back.
                         let tight = crate::health::level() != crate::health::Level::Calm;
-                        std::thread::sleep(if tight { took * 2 } else { took / 2 });
+                        std::thread::sleep(if tight { took * 2 } else { (took / 4).max(Duration::from_millis(4)) });
                     }
                     let shown = Instant::now();
                     if let Some(gap) = self.paced.0.map(|last| shown.duration_since(last)).filter(|gap| *gap < LULL) {
@@ -1901,8 +1902,18 @@ impl Runtime {
                 // the menu, never the temperature. Else the menu stays.
                 std::thread::sleep(Duration::from_millis(300));
                 self.input.press();
-                let waiting = Instant::now();
+                let mut waiting = Instant::now();
+                // The gen 2's nlclient may take that press only to wake its
+                // display (the UI held it at rest): its dial shows, and a
+                // second press, on the dial, opens the menu.
+                let mut pressed_again = !gen2::page(&self.display.save());
                 while !menu_shows(&mut self.display) {
+                    if !pressed_again && waiting.elapsed() > Duration::from_millis(700) && dial(&self.display.save()) {
+                        pressed_again = true;
+                        logf!("ui: nlclient's dial, not its menu: pressing again");
+                        self.input.press();
+                        waiting = Instant::now();
+                    }
                     if waiting.elapsed() > Duration::from_millis(1500) {
                         logf!("ui: nlclient's menu didn't show: left as it is");
                         return;
@@ -1921,13 +1932,17 @@ impl Runtime {
                 // (checked above by its pixels): one item, as before.
                 std::thread::sleep(Duration::from_millis(600));
                 let told = nlstate::read().is_some();
-                let steps: &[i32] = if told { &[40; MENU_ITEMS] } else { &[40] };
+                // The gen 2's menu (a row of items, Settings beside Back) is
+                // known by its pixels at every item: up to a lap, one item at
+                // a time, stopping should its dial show.
+                let small = gen2::page(&self.display.save());
+                let steps: &[i32] = if told || small { &[40; MENU_ITEMS] } else { &[40] };
                 let mut chosen = settings_chosen(&self.display.save());
                 for (n, &step) in steps.iter().enumerate() {
                     if chosen {
                         break;
                     }
-                    if told && !menu_shows(&mut self.display) {
+                    if told && !menu_shows(&mut self.display) || small && dial(&self.display.save()) {
                         logf!("ui: nlclient's menu went, {n} items turned: left as it is");
                         return;
                     }
@@ -1935,7 +1950,7 @@ impl Runtime {
                     std::thread::sleep(Duration::from_millis(450));
                     chosen = settings_chosen(&self.display.save());
                 }
-                if chosen && (!told || menu_shows(&mut self.display)) {
+                if chosen && (!told || menu_shows(&mut self.display)) && !(small && dial(&self.display.save())) {
                     self.input.press();
                     self.native_input = Instant::now();
                     self.settings_seen = 0;
