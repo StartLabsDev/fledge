@@ -242,6 +242,8 @@ pub struct Display {
     checked: std::time::Instant,
     /// Pans in a row that didn't land, on the gen 2 (check_pan).
     missed_pans: u8,
+    /// When a capture was last left for tools (CAPTURE).
+    captured: Option<std::time::Instant>,
 }
 
 /// The two pages, as nlclient's EGL flips between them: which one shows,
@@ -256,6 +258,7 @@ struct Flip {
 
 const FBIOGET_VSCREENINFO: libc::c_ulong = 0x4600;
 const CAPTURE_REQUEST: &str = "/var/run/unfr0zen/capture.request";
+const CAPTURE: &str = "/var/run/unfr0zen/capture.raw";
 const FBIOPAN_DISPLAY: libc::c_ulong = 0x4606;
 
 fn union(a: Option<(usize, usize)>, b: Option<(usize, usize)>) -> Option<(usize, usize)> {
@@ -295,7 +298,7 @@ impl Display {
             return Err(format!("/dev/fb0: mmap: {}", std::io::Error::last_os_error()));
         }
         Ok(Display { file, map: map.cast(), len, stride, side, turned: side == SIDE, flip: None,
-                     shown: vec![0; side * side * 4], checked: std::time::Instant::now(), missed_pans: 0 })
+                     shown: vec![0; side * side * 4], checked: std::time::Instant::now(), missed_pans: 0, captured: None })
     }
 
     /// The panel's side in pixels.
@@ -492,6 +495,13 @@ impl Display {
                 shown.clone()
             };
             let _ = crate::settings_ui::publish("capture.raw", &frame);
+            self.captured = Some(std::time::Instant::now());
+        }
+        // On the gen 2 /var/run is memory it can't spare (400 KB): a
+        // capture is for a tool to read at once, and gone half a minute on.
+        if !turned && self.captured.is_some_and(|at| at.elapsed() > Duration::from_secs(30)) {
+            self.captured = None;
+            let _ = std::fs::remove_file(CAPTURE);
         }
         if let Err(e) = prof::time(prof::Part::Pan, || self.pan_to(y)) {
             crate::logf!("ui: pan: {e}");
