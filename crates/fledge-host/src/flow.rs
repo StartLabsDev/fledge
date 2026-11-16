@@ -355,8 +355,8 @@ pub fn run(config: &Config, progress: &mut dyn Progress,
     let unit = device::detect(progress, config.wait_usb, config.omap, cancel)?;
     match unit.device {
         Device::Diamond3 => diamond3::run(config, progress, unit, cancel),
-        // Not yet: turned away before anything reaches it (device.rs).
-        Device::Diamond | Device::J49 if !device::older_nests() => Err(device::unsupported_thermostat(unit.device)),
+        // The 1st generation: turned away before anything reaches it (device.rs).
+        Device::Diamond if device::turned_away(unit.device) => Err(device::unsupported_thermostat(unit.device)),
         Device::Diamond | Device::J49 if config.options.external_temperature =>
             Err(failure("--external-temperature needs the 3rd generation's BLE: this unit has none")),
         Device::Diamond | Device::J49 => j49::run(config, progress, unit, cancel),

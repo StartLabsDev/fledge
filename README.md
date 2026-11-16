@@ -109,26 +109,33 @@ screens come back for Nest's dial and More Nest settings.
 
 ## Supported thermostats
 
-**Fledge supports the Nest Learning Thermostat (3rd generation) only.**
+**Fledge supports the Nest Learning Thermostat (3rd and 2nd generation).**
+2nd generation support is new and in release candidates: see below for what
+has been tested.
 
 > [!IMPORTANT]
-> **Not supported: the Nest Learning Thermostat (1st and 2nd generation), the
-> Nest Thermostat E and newer Nests.** Fledge's app recognises them, tells you
-> so, and does nothing to them. **For those, use
-> [unfr0zen](https://github.com/unfr0zen/unfr0zen).** That stays the case until
-> I have hardware to develop and test on, or someone who does sends a pull
-> request that has been tested on a real thermostat.
+> **Not supported: the Nest Learning Thermostat (1st generation), the Nest
+> Thermostat E and newer Nests.** Fledge's app recognises them, tells you so,
+> and does nothing to them. **For those, use
+> [unfr0zen](https://github.com/unfr0zen/unfr0zen).**
+
+On a 2nd generation Nest, Fledge's cards run on its smaller, slower display
+with 58 MB of memory: the cards keep fewer screens ready, and the chooser's
+cards zoom without the glow round the chosen one. **More Nest settings** shows
+how to open the Nest's own Settings by hand (press, then choose Settings),
+as its firmware takes no press from Fledge.
 
 | Device | Codename | SoC | MQTT | Matter (Wi-Fi) | Matter (Thread) | Zigbee |
 |-|-|-|-|-|-|-|
 | Nest Learning Thermostat (3rd generation) | `diamond3` | i.MX6SoloX | Tested | Tested | Tested | Tested |
 
 *Tested*: on a unit, by upstream unfr0zen, before Fledge's changes. Fledge
-itself has only been tested on one unit:
+itself has been tested on these:
 
 | | Generation | Nest firmware | Setup |
 |-|-|-|-|
 | Tested with Fledge | 3rd | 6.4-8 | European, Heat Link, heating and hot water, MQTT with Home Assistant |
+| Tested with Fledge | 2nd | 5.9.4-5 | Two units: on the bench and as a panel without heating (Act as a thermostat off), MQTT with Home Assistant |
 | Tested by upstream unfr0zen | 3rd | 5.9.4-5, 6.3-5, 6.4-8, 6.5-14 | |
 
 Other firmware versions aren't blocked: the patch finds what it changes by its

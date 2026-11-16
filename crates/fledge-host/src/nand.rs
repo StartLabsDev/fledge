@@ -130,7 +130,7 @@ pub fn run(job: &Job, wait_usb: Duration, omap: Option<Device>,
         }
     };
     let unit = device::detect(progress, wait_usb, omap, cancel)?;
-    if matches!(unit.device, Device::Diamond | Device::J49) && !device::older_nests() {
+    if unit.device == Device::Diamond && device::turned_away(unit.device) {
         // Not even a backup: the flasher isn't loaded onto it.
         return Err(device::unsupported_thermostat(unit.device));
     }

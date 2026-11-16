@@ -87,20 +87,29 @@ pub type CancelFlag = Arc<AtomicBool>;
 /// The unit on the bus, in whatever mode it is in. With none, asks for the
 /// button and waits up to `wait` for one in its boot ROM's USB download mode.
 /// A set `cancel` flag cuts the wait short.
-/// What Fledge says of a thermostat it doesn't support: everything but the
-/// Nest Learning Thermostat (3rd generation). Its cards need the 3rd
-/// generation's display; the 1st and 2nd generation draw to theirs another
-/// way, and none of it has been tried on one.
+/// What Fledge says of a thermostat it doesn't support: the 1st generation
+/// and the Nest Thermostat E. Its cards run on the 3rd and 2nd generation's
+/// displays; the 1st generation's has never had them tried on it.
 pub fn unsupported_thermostat(device: Device) -> Error {
-    Error::Device(format!("Unsupported thermostat: Fledge supports the Nest Learning Thermostat (3rd generation) only, \
+    Error::Device(format!("Unsupported thermostat: Fledge supports the Nest Learning Thermostat (3rd and 2nd generation), \
                            and this is a {}. Nothing was done to it. For this thermostat, use unfr0zen: \
                            https://github.com/unfr0zen/unfr0zen", device.description()))
 }
 
-/// Whether Fledge works with the 1st and 2nd generation: not yet, but
+/// Whether Fledge works with the 1st generation: not yet, but
 /// FLEDGE_OLDER_NESTS=1 lets a developer with one try (unfr0zen's code).
 pub fn older_nests() -> bool {
     std::env::var_os("FLEDGE_OLDER_NESTS").is_some()
+}
+
+/// Whether Fledge turns `device` away: the 1st generation (unless
+/// older_nests); the 2nd and 3rd are supported, the Nest Thermostat E never.
+pub fn turned_away(device: Device) -> bool {
+    match device {
+        Device::Diamond => !older_nests(),
+        Device::Onyx => true,
+        Device::J49 | Device::Diamond3 => false,
+    }
 }
 
 pub fn detect(progress: &mut dyn Progress, wait: Duration, omap: Option<Device>,
@@ -145,8 +154,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn older_nests_and_the_e_are_turned_away_alike() {
-        for device in [Device::Diamond, Device::J49, Device::Onyx] {
+    fn the_2nd_and_3rd_generation_are_supported() {
+        assert!(!turned_away(Device::J49) && !turned_away(Device::Diamond3));
+        assert!(turned_away(Device::Onyx));
+        assert_eq!(turned_away(Device::Diamond), !older_nests());
+    }
+
+    #[test]
+    fn the_1st_generation_and_the_e_are_turned_away_alike() {
+        for device in [Device::Diamond, Device::Onyx] {
             let message = unsupported_thermostat(device).to_string();
             assert!(message.contains("Unsupported thermostat") && message.contains(device.description())
                     && message.contains("unfr0zen"), "{message}");
