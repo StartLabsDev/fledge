@@ -59,6 +59,9 @@ pub fn start(report: Arc<dyn Report>) {
     let spawned = std::thread::Builder::new().name("nest_app".into()).spawn(move || {
         let mut watch = Watch::default();
         let mut trouble = false;
+        // Every ten minutes besides, retained: the first may come before
+        // the broker is connected.
+        let mut ticks = 0u32;
         loop {
             let now = Instant::now();
             let pid = crate::pids("nlclient").first().copied();
@@ -68,7 +71,8 @@ pub fn start(report: Arc<dyn Report>) {
                 logf!("nest app: nlclient restarted ({} in the last day)", watch.restarts.len());
             }
             let now_trouble = watch.trouble(now);
-            if changed || now_trouble != trouble {
+            ticks += 1;
+            if changed || now_trouble != trouble || ticks % 60 == 3 {
                 trouble = now_trouble;
                 report.nest_app(watch.pid.is_some(), watch.restarts.len(), trouble);
             }
