@@ -61,10 +61,11 @@ const SENSOR_ENTITIES: [(&str, &str); 2] = [("sensor", "external_temperature"), 
 /// What stays announced while the Nest isn't a thermostat (role.rs): what
 /// it senses and what keeps it, besides the motion sensors; nothing that
 /// controls or reports heating.
-const PANEL_ENTITIES: [&str; 20] = ["wwn_boiler_option", "current_temperature", "current_humidity", "backplate_temperature", "battery_level",
+const PANEL_ENTITIES: [&str; 24] = ["wwn_boiler_option", "current_temperature", "current_humidity", "backplate_temperature", "battery_level",
     "rssi", "local_ip", "occupancy", "light_level", "infrared_light", "external_power", "backplate_input_voltage",
     "temperature_scale", "act_as_thermostat",
-    "memory_used", "memory_left", "nest_page_faults", "memory_pressure", "cards_paused", "resume_cards"];
+    "memory_used", "memory_left", "nest_page_faults", "memory_pressure", "cards_paused", "resume_cards",
+    "nest_app_restarts", "nest_app_trouble", "ui_frame_typical", "ui_frame_slowest"];
 
 /// Whether the entity `key` stays announced while the Nest isn't a thermostat.
 fn on_a_panel(key: &str) -> bool {
