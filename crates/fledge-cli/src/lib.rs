@@ -105,7 +105,7 @@ struct Args {
     /// join a Zigbee network through the unit's radio, as a thermostat (replaces Heat Link); pair by permitting joins on the coordinator
     #[arg(long, help_heading = "Root filesystem options")]
     zigbee: bool,
-    /// run a Heat Link model (Display-3.x, Display-5.x) as heating a Works With Nest boiler through W1, for a Nest with no Heat Link, or one whose radio --zigbee/--matter-thread takes; without it firmware 6.4-8 stops on H71/H74 with no Heat Link
+    /// run a Heat Link model (Display-2.x, Display-3.x, Display-5.x) as heating a Works With Nest boiler through W1, for a Nest with no Heat Link, or one whose radio --zigbee/--matter-thread takes; without it firmware 6.4-8 stops on H71/H74 with no Heat Link
     #[arg(long, help_heading = "Root filesystem options")]
     wwn_boiler: bool,
     /// how the 3rd generation's boot ROM is entered for recovery: auto, cve-2017-7932, cve-2017-7936 or official-loader

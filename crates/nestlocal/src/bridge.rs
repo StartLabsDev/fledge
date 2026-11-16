@@ -1786,7 +1786,7 @@ pub mod tests {
             let configs = b.announced.lock().unwrap().clone().unwrap();
             configs.contains_key("homeassistant/switch/nestlocal_s/wwn_boiler_option/config")
         };
-        assert!(has("Display-3.4") && has("Display-5.1"));
-        assert!(!has("Display-2.9"));
+        assert!(has("Display-2.12") && has("Display-3.4") && has("Display-5.1"));
+        assert!(!has("Display-1.10"));
     }
 }
