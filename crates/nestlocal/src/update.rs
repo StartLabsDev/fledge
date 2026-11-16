@@ -40,6 +40,9 @@ const API_HOST: &str = "api.github.com";
 /// The release's binary and its signature.
 pub const ASSET: &str = "nestlocal-armv7";
 pub const SIGNATURE: &str = "nestlocal-armv7.sig";
+/// Held by a release whose nestlocal runs a gen 2's cards: only such a
+/// release is offered to a gen 2 (one without would take its cards away).
+pub const GEN2_ASSET: &str = "nestlocal.gen2";
 /// Left by an install until the new build is healthy (nestlocal.init).
 pub const PENDING: &str = "/etc/nestlocal/update.pending";
 /// There: Home Assistant's Fledgeling pre-releases switch is on.
@@ -72,6 +75,11 @@ pub struct Release {
 }
 
 impl Release {
+    /// Whether this release suits a unit of `generation`.
+    pub fn suits(&self, generation: u8) -> bool {
+        generation != 2 || self.assets.iter().any(|a| a.name == GEN2_ASSET)
+    }
+
     fn asset(&self, name: &str) -> Result<&Asset, String> {
         self.assets.iter().find(|a| a.name == name).ok_or_else(|| format!("{} has no {name}", self.tag))
     }
@@ -456,6 +464,11 @@ impl Updates {
         crate::wake::keep_awake_for(TIMEOUT.as_secs() + 5);
         let latest = tokio::time::timeout(TIMEOUT, fetch(&self.repo, self.tls.clone(), self.pre_releases())).await
             .map_err(|_| "timed out".to_string())??;
+        let generation = crate::device::current().generation;
+        if let Some(release) = latest.as_ref().filter(|r| !r.suits(generation)) {
+            crate::logf!("update: {} has no {GEN2_ASSET}: not offered to a gen 2", release.tag);
+        }
+        let latest = latest.filter(|r| r.suits(generation));
         *self.latest.lock().unwrap() = latest.clone();
         Ok(latest)
     }
@@ -583,6 +596,16 @@ async fn read(response: hyper::Response<hyper::body::Incoming>, limit: usize, pr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gen_2_is_offered_only_a_release_for_it() {
+        let asset = |name: &str| Asset { name: name.into(), url: String::new(), digest: String::new() };
+        let plain = Release { tag: "v0.11.0".into(), url: String::new(), notes: String::new(), assets: vec![asset(ASSET)] };
+        assert!(plain.suits(3));
+        assert!(!plain.suits(2), "it would take the gen 2's cards away");
+        let both = Release { assets: vec![asset(ASSET), asset(GEN2_ASSET)], ..plain };
+        assert!(both.suits(2) && both.suits(3));
+    }
 
     #[test]
     fn reads_the_tag_page_and_notes_of_the_latest_release() {

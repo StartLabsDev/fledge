@@ -896,7 +896,7 @@ fn theme_preview(fonts: &Fonts, theme: paint::Theme) -> (Vec<u8>, u32) {
     let rgb = p.rgb_upright();
     paint::set_theme(shown);
     // The whole dial, its ring round the edge.
-    (rgb, paint::SIZE)
+    (rgb, p.side())
 }
 
 /// Settings' Theme, as its mockup: the two looks side by side, each a small
@@ -1824,7 +1824,7 @@ pub fn glance_still(fonts: &Fonts, at: &GlanceIn) -> Canvas {
             let size = 30.0;
             let words = paint::measure(fonts.regular(), size, &said.text, 0.0).min(slot.room);
             let (width, height) = (words + 36.0, 46.0);
-            let face = if paint::fledge() { paint::FACE } else { BLACK };
+            let face = if paint::fledge() { paint::face_colour() } else { BLACK };
             paint::pill(&mut p, HALF - width / 2.0, slot.y - size * 0.36 - height / 2.0, width, height, alpha(face, 0.82));
         }
         glance_line(&mut p, fonts, slot, &said, coloured);

@@ -21,13 +21,17 @@ export NESTLOCAL_TARGET_DIR=${NESTLOCAL_TARGET_DIR:-.work/nestlocal-target}
 if [ "$(uname -s)" = Darwin ]; then
     command -v docker > /dev/null || { echo "Missing build tool: docker. See README.md." >&2; exit 1; }
     image=unfr0zen-build
+    # git describe on the host: inside the container a worktree's .git points
+    # outside the mount, and nestlocal would report itself as 0.1.0.
+    UNFR0ZEN_BUILD_VERSION=${UNFR0ZEN_BUILD_VERSION:-$(git describe --tag --always --dirty 2>/dev/null || true)}
+    export UNFR0ZEN_BUILD_VERSION
     echo "Building Docker image $image"
     docker build -q -t "$image" - < utils/ci/Dockerfile > /dev/null
     # The repository at the same path inside, so the submodule's and .work's
     # paths stay valid on both sides; cargo keeps its downloads in .work.
     run() {
         docker run --rm -v "$root:$root" -w "$root" --user "$(id -u):$(id -g)" \
-            -e HOME=/tmp -e CARGO_HOME="$root/.work/cargo" -e JOBS -e NESTLOCAL_RADIO -e NESTLOCAL_RADIO_EM357 -e NESTLOCAL_ZBWAKE -e NESTLOCAL_TARGET_DIR "$image" "$@"
+            -e HOME=/tmp -e CARGO_HOME="$root/.work/cargo" -e UNFR0ZEN_BUILD_VERSION -e JOBS -e NESTLOCAL_RADIO -e NESTLOCAL_RADIO_EM357 -e NESTLOCAL_ZBWAKE -e NESTLOCAL_TARGET_DIR "$image" "$@"
     }
 else
     missing=

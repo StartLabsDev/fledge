@@ -30,14 +30,31 @@ const HANDOVER_IMPORTS: [(&str, &str); 8] = [
     ("native_usleep", "usleep"),
     ("native_getpid", "getpid"),
 ];
-/// Whether nlclient has all the screen hand-over needs (HANDOVER_IMPORTS).
+/// The gen 2's hand-over natives, found in place of eglSwapBuffers and
+/// pthread_create: its framebuffer present (present_slot) and NSPR's thread
+/// start.
+const FB_PRESENT: &str = "native_fb_present";
+const PR_CREATE_THREAD: &str = "native_pr_create_thread";
+/// mmap, for custom_present's private mapping (framebuffer_fields).
+const FB_MMAP: &str = "native_mmap";
+/// The fields framebuffer_fields finds, 0 in a build without them.
+pub const FB_LAYOUT: [&str; 3] = ["FB_FD_OFFSET", "FB_MAP_OFFSET", "FB_SIZE_OFFSET"];
+/// Whether nlclient has all the screen hand-over needs: a present to wrap
+/// (eglSwapBuffers, or the gen 2's framebuffer present), a way to start the
+/// keeper's thread (pthread_create, or NSPR's), and the rest of
+/// HANDOVER_IMPORTS.
 pub fn handover(api: &BTreeMap<String, u32>) -> bool {
-    HANDOVER_IMPORTS.iter().all(|(key, _)| api.contains_key(*key))
+    let has = |key: &str| api.get(key).is_some_and(|&address| address != 0);
+    (has("native_egl_swap") || has(FB_PRESENT))
+        && (has("native_pthread_create") || has(PR_CREATE_THREAD))
+        && HANDOVER_IMPORTS
+            .iter()
+            .all(|(key, _)| matches!(*key, "native_egl_swap" | "native_pthread_create") || has(key))
 }
 
 /// The hand-over's natives, for linking a build without them: never called.
 pub fn handover_keys() -> impl Iterator<Item = &'static str> {
-    HANDOVER_IMPORTS.iter().map(|(key, _)| *key)
+    HANDOVER_IMPORTS.iter().map(|(key, _)| *key).chain([FB_PRESENT, PR_CREATE_THREAD, FB_MMAP])
 }
 
 /// The one call that presents nlclient's frames: a BL to eglSwapBuffers's
@@ -57,6 +74,96 @@ fn swap_call(elf: &Elf, stub: u32) -> Result<u32> {
         }
     }
     unique(sites, "eglSwapBuffers calls")
+}
+/// The gen 2's present: nlclient draws into /dev/fb0's two pages itself and
+/// shows each frame through one virtual method, which flips its page and pans
+/// to the drawn one with FBIOPAN_DISPLAY. The one vtable slot holding it,
+/// which the patch points at custom_present: skipping the method whole keeps
+/// nlclient drawing into the page that isn't shown.
+fn present_slot(elf: &Elf, ioctl: u32) -> Result<(u32, u32)> {
+    const PAN: u32 = 0xe304_1606; // movw r1, #0x4606 (FBIOPAN_DISPLAY)
+    const PROLOGUE: u32 = 0xe1a0_c00d; // mov ip, sp
+    let text = elf.section(".text")?;
+    let end = text.address + text.size as u32;
+    let at = |pc: u32| word(elf.data, text.offset + (pc - text.address) as usize);
+    let calls = |pc: u32, target: u32| {
+        at(pc).is_ok_and(|w| {
+            let delta = (((w & 0xff_ffff) << 8) as i32) >> 6;
+            w >> 24 == 0xeb && pc.wrapping_add(8).wrapping_add(delta as u32) == target
+        })
+    };
+    let mut methods = Vec::new();
+    for pc in (text.address..end).step_by(4) {
+        if at(pc)? != PAN || !(pc + 4..(pc + 32).min(end)).step_by(4).any(|c| calls(c, ioctl)) {
+            continue;
+        }
+        let start = (1..=32u32)
+            .map(|n| pc.wrapping_sub(4 * n))
+            .take_while(|&a| a >= text.address)
+            .find(|&a| at(a).is_ok_and(|w| w == PROLOGUE));
+        methods.extend(start);
+    }
+    let method = unique(methods, "FBIOPAN_DISPLAY presents")?;
+    let mut slots = Vec::new();
+    for s in elf.sections.iter().filter(|s| s.address != 0 && s.kind == 1 && s.flags & 4 == 0) {
+        let data = elf.contents(s);
+        for o in (0..data.len().saturating_sub(3)).step_by(4) {
+            if word(data, o)? == method {
+                slots.push(s.address + o as u32);
+            }
+        }
+    }
+    Ok((method, unique(slots, "present method slots")?))
+}
+/// The present's object (the gen 2's nlARMFramebuffer): its init, the
+/// method two slots before the present, maps fb0 with
+/// `mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)` and stores the
+/// address. The fields that hold fb0's descriptor, the mapping's address and
+/// its length (as unfr0zen's custom_flip finds them).
+fn framebuffer_fields(elf: &Elf, arm: &Arm, imports: &BTreeMap<String, u32>, slot: u32) -> Result<[(&'static str, u32); 3]> {
+    require(half(elf.data, 16)? == 2, "framebuffer mapping needs an EXEC build")?;
+    let mmap = *imports.get("mmap").ok_or_else(|| crate::Error::Device("framebuffer mapping needs mmap".into()))?;
+    let init = elf.read(slot - 8)?;
+    let target = |i: &Ins| i.ops.first().and_then(Op::imm);
+    let code = arm.code(init, None)?;
+    let call = unique(
+        code.iter().enumerate().filter(|(_, i)| i.name == "bl" && target(i) == Some(mmap)).map(|(n, _)| n),
+        "framebuffer mmap call",
+    )?;
+    // A store of `reg` into the object (the base register `this` is in).
+    let field = |i: &Ins, reg: &str| -> Option<(String, u32)> {
+        let (base, disp, indexed) = i.ops.get(1)?.mem()?;
+        (i.name == "str" && i.ops.first()?.reg() == Some(reg) && base != "sp" && !indexed && disp > 0)
+            .then(|| (base.to_owned(), disp as u32))
+    };
+    let (this, map) = code[call + 1..code.len().min(call + 5)]
+        .iter()
+        .find_map(|i| field(i, "r0"))
+        .ok_or_else(|| crate::Error::Device("framebuffer mapping not stored".into()))?;
+    let before = &code[call.saturating_sub(12)..call];
+    let size = before
+        .iter()
+        .rev()
+        .find_map(|i| field(i, "r1").filter(|(b, _)| *b == this))
+        .ok_or_else(|| crate::Error::Device("framebuffer mapping length not stored".into()))?
+        .1;
+    // The fifth argument, fb0's descriptor, goes on the stack from a field.
+    let stacked = before
+        .iter()
+        .rev()
+        .find(|i| i.name == "str" && i.ops.get(1).and_then(Op::mem) == Some(("sp", 0, false)))
+        .and_then(|i| i.ops.first()?.reg())
+        .ok_or_else(|| crate::Error::Device("framebuffer descriptor not passed".into()))?;
+    let fd = before
+        .iter()
+        .rev()
+        .find_map(|i| {
+            let (base, disp, indexed) = i.ops.get(1)?.mem()?;
+            (i.name == "ldr" && i.ops.first()?.reg() == Some(stacked) && base == this && !indexed)
+                .then_some(disp as u32)
+        })
+        .ok_or_else(|| crate::Error::Device("framebuffer descriptor field not found".into()))?;
+    Ok([("FB_FD_OFFSET", fd), ("FB_MAP_OFFSET", map), ("FB_SIZE_OFFSET", size)])
 }
 /// nlclient's report of what its display shows: the one function that logs
 /// the UiDisplayChange telemetry event, taking what changed (its screen, its
@@ -372,12 +479,19 @@ pub fn survey(data: &[u8]) -> Result<(Discovery, Option<String>)> {
     }
     // The screen hand-over: nlclient presents each frame through one call
     // of eglSwapBuffers, which the payload wraps (custom_swap), and a thread
-    // of its own keeps the display lit. The gen 2's nlclient draws straight
-    // to the framebuffer, with no EGL and no pthread_create: it gets the
-    // rest of the screen, without the hand-over (handover()).
+    // of its own keeps the display lit. The gen 2 has no EGL and no
+    // pthread_create: its frames are presented through the framebuffer
+    // (present_slot, below) and its thread is started through NSPR's
+    // PR_CreateThread. An nlclient with neither gets the rest of the
+    // screen, without the hand-over (handover()).
     for (key, name) in HANDOVER_IMPORTS {
         if let Some(&address) = imports.get(name) {
             api.insert(key.to_owned(), address);
+        }
+    }
+    if !api.contains_key("native_pthread_create") {
+        if let Some(&address) = imports.get("PR_CreateThread") {
+            api.insert(PR_CREATE_THREAD.to_owned(), address);
         }
     }
     let table = registry(&elf)?;
@@ -647,8 +761,29 @@ pub fn survey(data: &[u8]) -> Result<(Discovery, Option<String>)> {
     api.insert("native_scroll_target".into(), select[1]);
     layout.insert("GLOBALS_TIMER_OFFSET".into(), timer(&elf, &arm, &imports)?);
     downlink(&elf, &arm, &imports, &mut api, &mut layout, &mut anchors)?;
-    if handover(&api) {
-        anchors.insert("swap_call_slot".into(), swap_call(&elf, api["native_egl_swap"])?);
+    // The present the hand-over wraps: eglSwapBuffers's one call, or the
+    // gen 2's framebuffer present, where one is found.
+    if let Some(&swap) = api.get("native_egl_swap") {
+        if handover(&api) {
+            anchors.insert("swap_call_slot".into(), swap_call(&elf, swap)?);
+        }
+    } else if let Some(Ok((method, slot))) = imports.get("ioctl").map(|&ioctl| present_slot(&elf, ioctl)) {
+        api.insert(FB_PRESENT.to_owned(), method);
+        if handover(&api) {
+            anchors.insert("present_slot".into(), slot);
+            // Where the present's object keeps fb0's mapping: while the UI
+            // owns the display, custom_present maps private memory over it,
+            // so nlclient draws unseen and the UI has both pages to flip.
+            // Without it the UI keeps to the page shown (FB_MAP_OFFSET 0).
+            if let Ok(fields) = framebuffer_fields(&elf, &arm, &imports, slot) {
+                api.insert(FB_MMAP.to_owned(), imports["mmap"]);
+                for (key, value) in fields {
+                    layout.insert(key.into(), value);
+                }
+            }
+        } else {
+            api.remove(FB_PRESENT);
+        }
     }
     let ui_change = ui_change(&elf, &arm, &imports).ok();
     require(

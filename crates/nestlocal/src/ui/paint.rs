@@ -6,7 +6,9 @@ use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Transform};
 
 use super::icons::Icon;
 
-/// The round display's side, in pixels.
+/// The round display's side, in pixels: the units screens are laid out in.
+/// A canvas for a smaller panel (the gen 2's, 320) holds fewer pixels, each
+/// SIZE / side units (Canvas::scale), and draws the same layout scaled.
 pub const SIZE: u32 = 480;
 const CENTRE: f32 = SIZE as f32 / 2.0;
 /// The ring's outer edge, and how long its ticks are: as nlclient's dial.
@@ -36,6 +38,21 @@ pub struct Fonts {
 }
 
 impl Fonts {
+    /// Fledge's own fonts standing in for the Nest's, which aren't in the
+    /// repository: for tests that draw (ui::shots::draw_times).
+    #[cfg(test)]
+    pub fn built_in() -> Fonts {
+        let font = |data: &'static [u8]| FontArc::try_from_slice(data).unwrap();
+        Fonts {
+            nest_regular: font(include_bytes!("fonts/DMSans-Regular.ttf")),
+            nest_medium: font(include_bytes!("fonts/DMSans-Medium.ttf")),
+            fledge_regular: font(include_bytes!("fonts/DMSans-Regular.ttf")),
+            fledge_medium: font(include_bytes!("fonts/DMSans-Medium.ttf")),
+            fledge_digits: font(include_bytes!("fonts/Outfit-ExtraLight.ttf")),
+            fledge_clock: font(include_bytes!("fonts/Outfit-Light.ttf")),
+        }
+    }
+
     pub fn load(dir: &str) -> Result<Fonts, String> {
         let load = |name: &str| -> Result<FontArc, String> {
             let path = format!("{dir}/{name}");
@@ -45,7 +62,8 @@ impl Fonts {
         let built_in = |data: &'static [u8]| FontArc::try_from_slice(data).map_err(|e| format!("a built-in font: {e}"));
         Ok(Fonts {
             nest_regular: load("AkkuratNest-Regular.ttf")?,
-            nest_medium: load("AkkuratNest-Medium.ttf")?,
+            // The gen 2 has the Nest's bold in its place.
+            nest_medium: load("AkkuratNest-Medium.ttf").or_else(|_| load("AkkuratNest-Bold.ttf"))?,
             fledge_regular: built_in(include_bytes!("fonts/DMSans-Regular.ttf"))?,
             fledge_medium: built_in(include_bytes!("fonts/DMSans-Medium.ttf"))?,
             fledge_digits: built_in(include_bytes!("fonts/Outfit-ExtraLight.ttf"))?,
@@ -93,15 +111,59 @@ pub fn fledge() -> bool {
 }
 
 /// Fledge's face, its ring's track, and its list highlight.
-pub const FACE: [u8; 3] = [9, 13, 21];
-pub const TRACK: [u8; 3] = [27, 35, 48];
+const NAVY_FACE: [u8; 3] = [9, 13, 21];
+const NAVY_TRACK: [u8; 3] = [27, 35, 48];
 /// The lift in the middle of Fledge's face: a deep blue.
 const FACE_LIFT: [u8; 3] = [22, 31, 48];
-const FLEDGE_SELECT: [u8; 3] = [58, 68, 86];
+const NAVY_SELECT: [u8; 3] = [58, 68, 86];
+/// On a black face: the same, neutral.
+const BLACK_TRACK: [u8; 3] = [34, 34, 37];
+const BLACK_SELECT: [u8; 3] = [58, 58, 62];
+
+/// Fledge's face: navy lifted with blue in the middle, or black (with only
+/// heating's or cooling's glow, or none), as the device's own black glass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FaceStyle {
+    Navy = 0,
+    Black = 1,
+    BlackGlow = 2,
+}
+
+/// Fledge's look is black with glow (Ben, 2026-11-16: the navy read as a
+/// screen, not part of the device).
+static FACE_STYLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(FaceStyle::BlackGlow as u8);
+
+/// Another face than Fledge's own, for the screens' previews (ui::shots).
+#[cfg(test)]
+pub fn set_face_style(style: FaceStyle) {
+    FACE_STYLE.store(style as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn face_style() -> FaceStyle {
+    match FACE_STYLE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => FaceStyle::Black,
+        2 => FaceStyle::BlackGlow,
+        _ => FaceStyle::Navy,
+    }
+}
+
+/// Fledge's face colour, under its glow.
+pub fn face_colour() -> [u8; 3] {
+    if face_style() == FaceStyle::Navy { NAVY_FACE } else { BLACK }
+}
+
+/// A ring's unlit track in Fledge's look.
+fn track() -> [u8; 3] {
+    if face_style() == FaceStyle::Navy { NAVY_TRACK } else { BLACK_TRACK }
+}
 
 /// A list's highlight, in the theme's colour.
 pub fn select() -> [u8; 3] {
-    if fledge() { FLEDGE_SELECT } else { SELECT }
+    match (fledge(), face_style()) {
+        (false, _) => SELECT,
+        (true, FaceStyle::Navy) => NAVY_SELECT,
+        (true, _) => BLACK_SELECT,
+    }
 }
 
 /// A screen's face: `background` whole (the Nest's), or Fledge's dark face
@@ -114,15 +176,22 @@ pub fn face(background: [u8; 3]) -> Canvas {
     if !fledge() {
         return canvas(background);
     }
-    type Key = ([u8; 3], bool);
+    let style = face_style();
+    if style == FaceStyle::Black || style == FaceStyle::BlackGlow && background == BLACK {
+        // Nothing to glow: plain black, no cached copy to keep.
+        return canvas(BLACK);
+    }
+    type Key = ([u8; 3], bool, u32, u8);
     static FACES: std::sync::Mutex<Vec<(Key, Canvas)>> = std::sync::Mutex::new(Vec::new());
-    let key = (background, PANEL.load(std::sync::atomic::Ordering::Relaxed));
+    let key = (background, PANEL.load(std::sync::atomic::Ordering::Relaxed), side(), style as u8);
     let mut faces = FACES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, face)) = faces.iter().find(|(k, _)| *k == key) {
         return face.clone();
     }
-    let mut p = canvas(FACE);
-    glow(&mut p, FACE_LIFT, 240.0, 210.0, 330.0, 0.7);
+    let mut p = canvas(face_colour());
+    if style == FaceStyle::Navy {
+        glow(&mut p, FACE_LIFT, 240.0, 210.0, 330.0, 0.7);
+    }
     if background != BLACK {
         // Cooling glows a lighter, cyan-leaning blue, near as strongly as
         // heating's orange: COOL itself reads dark and muddy as a glow.
@@ -132,6 +201,10 @@ pub fn face(background: [u8; 3]) -> Canvas {
             other => (other, 0.42),
         };
         glow(&mut p, c, 240.0, 272.0, 300.0, strength);
+        if style == FaceStyle::BlackGlow {
+            // Black by the glass's edge (radius 240), as the bezel is.
+            fade_edge(&mut p, 150.0, 226.0);
+        }
     }
     // A few backgrounds in all (black, heating, cooling): the oldest goes
     // once there are more.
@@ -142,22 +215,50 @@ pub fn face(background: [u8; 3]) -> Canvas {
     p
 }
 
+/// Darkens toward black from `inner` out from the middle of the display to
+/// black at `outer` (on SIZE's scale), smoothly: a face's glow ends inside
+/// the round glass, which then meets the device's black bezel unbroken.
+fn fade_edge(p: &mut Canvas, inner: f32, outer: f32) {
+    let (s, side) = (p.scale(), p.side);
+    let (centre, inner, outer) = (CENTRE * s, inner * s, outer * s);
+    let panel = p.panel;
+    let data = p.pixmap.data_mut();
+    for y in 0..side {
+        let dy = y as f32 + 0.5 - centre;
+        for x in 0..side {
+            let dx = x as f32 + 0.5 - centre;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d <= inner {
+                continue;
+            }
+            let t = ((d - inner) / (outer - inner)).clamp(0.0, 1.0);
+            let keep = 1.0 - t * t * (3.0 - 2.0 * t);
+            let at = 4 * if panel { x * side + (side - 1 - y) } else { y * side + x } as usize;
+            for k in 0..3 {
+                data[at + k] = (data[at + k] as f32 * keep).round() as u8;
+            }
+        }
+    }
+}
+
 /// A soft radial glow of `c` round (cx, cy), `radius` out, `strength` (0..1)
 /// at its middle.
 pub fn glow(p: &mut Canvas, c: [u8; 3], cx: f32, cy: f32, radius: f32, strength: f32) {
     let c = p.rgb(c);
+    let (s, side) = (p.scale(), p.side);
+    let (cx, cy, radius) = (cx * s, cy * s, radius * s);
     let panel = p.panel;
     let data = p.pixmap.data_mut();
-    for y in 0..SIZE {
+    for y in 0..side {
         let dy = y as f32 + 0.5 - cy;
-        for x in 0..SIZE {
+        for x in 0..side {
             let dx = x as f32 + 0.5 - cx;
             let d = (dx * dx + dy * dy).sqrt() / radius;
             if d >= 1.0 {
                 continue;
             }
             let a = strength * (1.0 - d) * (1.0 - d);
-            let at = 4 * if panel { x * SIZE + (SIZE - 1 - y) } else { y * SIZE + x } as usize;
+            let at = 4 * if panel { x * side + (side - 1 - y) } else { y * side + x } as usize;
             for k in 0..3 {
                 let old = data[at + k] as f32;
                 data[at + k] = (old + (c[k] as f32 - old) * a).round() as u8;
@@ -186,11 +287,23 @@ pub const MEDIA: [u8; 3] = [63, 209, 195];
 pub const SELECT: [u8; 3] = [26, 115, 232];
 
 static PANEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PANEL_SIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(SIZE);
 
 /// Draws for the unit's panel from now on: in the framebuffer's own layout,
 /// so a frame goes to the display as it is, with no turning.
 pub fn for_panel() {
     PANEL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The panel's side in pixels from now on, as panel canvases and frames have
+/// it: SIZE, or 320 on the gen 2.
+pub fn set_side(side: u32) {
+    PANEL_SIDE.store(side, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A frame's side in pixels (device::Frame).
+pub fn side() -> u32 {
+    PANEL_SIDE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// What a screen is drawn on. Its coordinates are always the display's,
@@ -202,6 +315,8 @@ pub fn for_panel() {
 pub struct Canvas {
     pub pixmap: Pixmap,
     panel: bool,
+    /// Its side in pixels: SIZE, or a smaller panel's.
+    side: u32,
 }
 
 impl Canvas {
@@ -214,20 +329,50 @@ impl Canvas {
         if self.panel { Color::from_rgba(c.blue(), c.green(), c.red(), c.alpha()).unwrap_or(c) } else { c }
     }
 
-    /// Where upright paths land.
+    /// Pixels a unit: 1, or less on a smaller panel.
+    pub fn scale(&self) -> f32 {
+        self.side as f32 / SIZE as f32
+    }
+
+    /// Its side in pixels.
+    pub fn side(&self) -> u32 {
+        self.side
+    }
+
+    /// Where upright paths, in units, land.
     fn transform(&self) -> Transform {
-        if self.panel { Transform::from_row(0.0, 1.0, -1.0, 0.0, SIZE as f32, 0.0) } else { Transform::identity() }
+        let (s, side) = (self.scale(), self.side as f32);
+        if self.panel { Transform::from_row(0.0, s, -s, 0.0, side, 0.0) } else { Transform::from_scale(s, s) }
     }
 
     /// The byte of upright pixel (x, y), which must be on the canvas.
     fn at(&self, x: u32, y: u32) -> usize {
-        4 * if self.panel { x * SIZE + (SIZE - 1 - y) } else { y * SIZE + x } as usize
+        let side = self.side;
+        4 * if self.panel { x * side + (side - 1 - y) } else { y * side + x } as usize
     }
 
-    /// Puts back the upright rectangle (x, y, w, h) from `still`.
+    /// The pixels the upright rectangle (x, y, w, h), in units, covers.
+    fn pixels(&self, x: i32, y: i32, w: usize, h: usize) -> (i32, i32, usize, usize) {
+        let s = self.scale();
+        if s == 1.0 {
+            return (x, y, w, h);
+        }
+        let (x0, y0) = ((x as f32 * s).floor() as i32, (y as f32 * s).floor() as i32);
+        let (x1, y1) = (((x + w as i32) as f32 * s).ceil() as i32, ((y + h as i32) as f32 * s).ceil() as i32);
+        (x0, y0, (x1 - x0).max(0) as usize, (y1 - y0).max(0) as usize)
+    }
+
+    /// Puts back the upright rectangle (x, y, w, h), in units, from `still`.
     fn restore(&mut self, still: &Canvas, x: i32, y: i32, w: usize, h: usize) {
+        let (x, y, w, h) = self.pixels(x, y, w, h);
+        self.restore_pixels(still, x, y, w, h);
+    }
+
+    /// Puts back the upright rectangle (x, y, w, h), in pixels, from `still`.
+    fn restore_pixels(&mut self, still: &Canvas, x: i32, y: i32, w: usize, h: usize) {
+        let side = self.side;
         let (x0, y0) = (x.max(0) as u32, y.max(0) as u32);
-        let (x1, y1) = ((x + w as i32).clamp(0, SIZE as i32) as u32, (y + h as i32).clamp(0, SIZE as i32) as u32);
+        let (x1, y1) = ((x + w as i32).clamp(0, side as i32) as u32, (y + h as i32).clamp(0, side as i32) as u32);
         if x0 >= x1 || y0 >= y1 {
             return;
         }
@@ -236,12 +381,12 @@ impl Canvas {
         if self.panel {
             // An upright column is a framebuffer row.
             for column in x0..x1 {
-                let (a, b) = (4 * (column * SIZE + (SIZE - y1)) as usize, 4 * (column * SIZE + (SIZE - y0)) as usize);
+                let (a, b) = (4 * (column * side + (side - y1)) as usize, 4 * (column * side + (side - y0)) as usize);
                 to[a..b].copy_from_slice(&from[a..b]);
             }
         } else {
             for row in y0..y1 {
-                let (a, b) = (4 * (row * SIZE + x0) as usize, 4 * (row * SIZE + x1) as usize);
+                let (a, b) = (4 * (row * side + x0) as usize, 4 * (row * side + x1) as usize);
                 to[a..b].copy_from_slice(&from[a..b]);
             }
         }
@@ -257,7 +402,9 @@ impl Canvas {
     /// A frame as a canvas in the upright layout (previews and tests).
     #[cfg(test)]
     pub fn from_frame(frame: Vec<u8>) -> Canvas {
-        Canvas { pixmap: Pixmap::from_vec(frame, tiny_skia::IntSize::from_wh(SIZE, SIZE).expect("480")).expect("480x480"), panel: false }
+        let side = ((frame.len() / 4) as f64).sqrt().round() as u32;
+        Canvas { pixmap: Pixmap::from_vec(frame, tiny_skia::IntSize::from_wh(side, side).expect("a side")).expect("a square frame"),
+                 panel: false, side }
     }
 }
 
@@ -265,9 +412,9 @@ impl Canvas {
     /// The picture upright, as RGB (a preview drawn small elsewhere).
     pub fn rgb_upright(&self) -> Vec<u8> {
         let data = self.pixmap.data();
-        let mut out = Vec::with_capacity((SIZE * SIZE * 3) as usize);
-        for y in 0..SIZE {
-            for x in 0..SIZE {
+        let mut out = Vec::with_capacity((self.side * self.side * 3) as usize);
+        for y in 0..self.side {
+            for x in 0..self.side {
                 let at = self.at(x, y);
                 let px = [data[at], data[at + 1], data[at + 2]];
                 out.extend(if self.panel { [px[2], px[1], px[0]] } else { px });
@@ -282,7 +429,31 @@ pub fn canvas(background: [u8; 3]) -> Canvas {
 }
 
 fn canvas_for(background: [u8; 3], panel: bool) -> Canvas {
-    let mut canvas = Canvas { pixmap: Pixmap::new(SIZE, SIZE).expect("480x480"), panel };
+    canvas_sized(background, panel, if panel { side() } else { preview_side() })
+}
+
+/// A preview's side: SIZE, or in tests what preview_at set on this thread.
+fn preview_side() -> u32 {
+    #[cfg(test)]
+    return PREVIEW_SIDE.with(|side| side.get());
+    #[cfg(not(test))]
+    SIZE
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREVIEW_SIDE: std::cell::Cell<u32> = const { std::cell::Cell::new(SIZE) };
+}
+
+/// Previews drawn `side` pixels across on this thread from now on: how a
+/// smaller panel (the gen 2's) shows the screens, in tests.
+#[cfg(test)]
+pub fn preview_at(side: u32) {
+    PREVIEW_SIDE.with(|cell| cell.set(side));
+}
+
+fn canvas_sized(background: [u8; 3], panel: bool, side: u32) -> Canvas {
+    let mut canvas = Canvas { pixmap: Pixmap::new(side, side).expect("a panel's side"), panel, side };
     let background = canvas.rgb(background);
     canvas.pixmap.fill(colour(background));
     canvas
@@ -344,8 +515,9 @@ pub fn ring_shaped(canvas: &mut Canvas, of: impl Fn(usize) -> (Color, Shape)) {
         shapes[i] = shape;
     }
     let panel = canvas.panel;
+    let pixels = ring_pixels(canvas.side);
     let data = canvas.pixmap.data_mut();
-    for p in ring_pixels() {
+    for p in pixels {
         let tick = p.tick as usize;
         let cover = p.cover(shapes[tick]) as u16;
         let [r, g, b, a] = colours[tick];
@@ -377,9 +549,9 @@ pub struct Live {
     shapes: [Shape; TICKS],
     fresh: bool,
     number: String,
-    /// The old number's glyphs, (x, y, width, height), upright.
+    /// The old number's glyphs, (x, y, width, height), upright, in pixels.
     glyphs: Vec<(i32, i32, usize, usize)>,
-    /// The upright columns (the panel's rows) this frame changed.
+    /// The upright columns (the panel's rows) this frame changed, in pixels.
     pub columns: Option<(u32, u32)>,
     /// What Fledge's arc drew over itself last frame (its knob, dots and
     /// rounded ends): each one's box, and the ticks under it.
@@ -402,7 +574,8 @@ impl Live {
     /// over the ring each frame (the temperature now's number), as it fades.
     pub fn clear(&mut self, canvas: &mut Canvas, (x, y, w, h): (i32, i32, usize, usize), ticks: std::ops::RangeInclusive<usize>) {
         canvas.restore(&self.still, x, y, w, h);
-        self.changed(x.max(0) as u32, (x + w as i32).clamp(0, SIZE as i32) as u32);
+        let (x, _, w, _) = canvas.pixels(x, y, w, h);
+        self.changed(x.max(0) as u32, (x + w as i32).clamp(0, canvas.side as i32) as u32);
         for tick in ticks {
             if let Some(drawn) = self.drawn.get_mut(tick) {
                 *drawn = [u16::MAX; 4];
@@ -421,7 +594,7 @@ pub fn ring_shaped_live(canvas: &mut Canvas, live: &mut Live, of: impl Fn(usize)
     if fledge() {
         return arc(canvas, Some(live), of);
     }
-    let panel = canvas.panel;
+    let (panel, side) = (canvas.panel, canvas.side);
     for tick in 0..TICKS {
         let (tint, shape) = of(tick);
         let u = canvas.colour(tint).to_color_u8();
@@ -434,14 +607,14 @@ pub fn ring_shaped_live(canvas: &mut Canvas, live: &mut Live, of: impl Fn(usize)
         let still = live.still.pixmap.data();
         let data = canvas.pixmap.data_mut();
         let (mut low, mut high) = (u32::MAX, 0);
-        for p in tick_pixels(tick) {
+        for p in tick_pixels(side, tick) {
             let at = 4 * if panel { p.panel } else { p.upright } as usize;
             let cover = p.cover(shape) as u16 * a / 255;
             let blend = |d: u8, s: u16| ((s * cover + d as u16 * (255 - cover)) / 255) as u8;
             data[at] = blend(still[at], r);
             data[at + 1] = blend(still[at + 1], g);
             data[at + 2] = blend(still[at + 2], b);
-            let column = p.upright % SIZE;
+            let column = p.upright % side;
             (low, high) = (low.min(column), high.max(column));
         }
         if low <= high {
@@ -458,15 +631,16 @@ pub fn number_live(canvas: &mut Canvas, live: &mut Live, parts: &[(&FontArc, f32
     if !live.fresh && key == live.number {
         return;
     }
+    let side = canvas.side as i32;
     for (x, y, w, h) in std::mem::take(&mut live.glyphs) {
-        canvas.restore(&live.still, x, y, w, h);
-        live.changed(x.max(0) as u32, (x + w as i32).clamp(0, SIZE as i32) as u32);
+        canvas.restore_pixels(&live.still, x, y, w, h);
+        live.changed(x.max(0) as u32, (x + w as i32).clamp(0, side) as u32);
     }
     for &(font, size, x, y, text, spacing) in parts {
         let mut glyphs = Vec::new();
         text_with(canvas, font, size, x, y, text, spacing, c, 1.0, &mut glyphs);
         for &(gx, _, gw, _) in &glyphs {
-            live.changed(gx.max(0) as u32, (gx + gw as i32).clamp(0, SIZE as i32) as u32);
+            live.changed(gx.max(0) as u32, (gx + gw as i32).clamp(0, side) as u32);
         }
         live.glyphs.extend(glyphs);
     }
@@ -490,14 +664,43 @@ struct RingPixel {
     wide: u8,
 }
 
-fn ring_pixels() -> &'static [RingPixel] {
-    &ring_geometry().0
+fn ring_pixels(side: u32) -> &'static [RingPixel] {
+    &ring_geometry(side).0
 }
 
 /// Each tick's pixels in ring_pixels.
-fn tick_pixels(tick: usize) -> &'static [RingPixel] {
-    let (pixels, starts) = ring_geometry();
+fn tick_pixels(side: u32, tick: usize) -> &'static [RingPixel] {
+    let (pixels, starts) = ring_geometry(side);
     &pixels[starts[tick]..starts[tick + 1]]
+}
+
+/// A ring's pixels and where each tick's start, as worked out for a side.
+type Geometry = (Vec<RingPixel>, Vec<usize>);
+
+/// `make(side)`, worked out once per side (a process draws for one panel,
+/// and tests at SIZE).
+fn per_side(cache: &'static std::sync::Mutex<Vec<(u32, &'static Geometry)>>, side: u32,
+            make: fn(u32) -> Geometry) -> &'static Geometry {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, geometry)) = cache.iter().find(|(s, _)| *s == side) {
+        return geometry;
+    }
+    let geometry: &'static Geometry = Box::leak(Box::new(make(side)));
+    cache.push((side, geometry));
+    geometry
+}
+
+/// Pixels sorted by tick, and each tick's first.
+fn by_tick(mut pixels: Vec<RingPixel>) -> Geometry {
+    pixels.sort_by_key(|p| p.tick);
+    let mut starts = vec![0; TICKS + 1];
+    for p in &pixels {
+        starts[p.tick as usize + 1] += 1;
+    }
+    for i in 0..TICKS {
+        starts[i + 1] += starts[i];
+    }
+    (pixels, starts)
 }
 
 /// Fledge's arc: its middle's radius, the band's half width, and how far
@@ -512,16 +715,18 @@ const DOT: f32 = 5.5;
 /// Fledge's arc, as ring_geometry is the ticks': each pixel of the band
 /// and its glow, by the tick (the slice of the arc) it's in; `short` the
 /// band's cover, `long` the glow's.
-fn arc_geometry() -> &'static (Vec<RingPixel>, Vec<usize>) {
-    static GEOMETRY: std::sync::OnceLock<(Vec<RingPixel>, Vec<usize>)> = std::sync::OnceLock::new();
-    GEOMETRY.get_or_init(|| {
+fn arc_geometry(side: u32) -> &'static Geometry {
+    static CACHE: std::sync::Mutex<Vec<(u32, &'static Geometry)>> = std::sync::Mutex::new(Vec::new());
+    per_side(&CACHE, side, |side| {
         let mut pixels = Vec::new();
         let step = SPAN / (TICKS - 1) as f32;
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                let (dx, dy) = (x as f32 + 0.5 - CENTRE, y as f32 + 0.5 - CENTRE);
-                let off = ((dx * dx + dy * dy).sqrt() - ARC).abs();
-                if off > HALO {
+        let s = side as f32 / SIZE as f32;
+        let (centre, arc, band, halo) = (side as f32 / 2.0, ARC * s, BAND * s, HALO * s);
+        for y in 0..side {
+            for x in 0..side {
+                let (dx, dy) = (x as f32 + 0.5 - centre, y as f32 + 0.5 - centre);
+                let off = ((dx * dx + dy * dy).sqrt() - arc).abs();
+                if off > halo {
                     continue;
                 }
                 let angle = dx.atan2(-dy).to_degrees();
@@ -530,20 +735,12 @@ fn arc_geometry() -> &'static (Vec<RingPixel>, Vec<usize>) {
                     continue; // the ends' round caps are drawn as extras
                 }
                 let tick = at.round().clamp(0.0, (TICKS - 1) as f32) as u8;
-                let band = ((BAND + 0.5 - off).clamp(0.0, 1.0) * 255.0).round() as u8;
-                let halo = ((1.0 - off / HALO).powi(2) * 255.0).round() as u8;
-                pixels.push(RingPixel { upright: y * SIZE + x, panel: x * SIZE + (SIZE - 1 - y), tick, short: band, long: halo, wide: 0 });
+                let cover = ((band + 0.5 - off).clamp(0.0, 1.0) * 255.0).round() as u8;
+                let glow = ((1.0 - off / halo).powi(2) * 255.0).round() as u8;
+                pixels.push(RingPixel { upright: y * side + x, panel: x * side + (side - 1 - y), tick, short: cover, long: glow, wide: 0 });
             }
         }
-        pixels.sort_by_key(|p| p.tick);
-        let mut starts = vec![0; TICKS + 1];
-        for p in &pixels {
-            starts[p.tick as usize + 1] += 1;
-        }
-        for i in 0..TICKS {
-            starts[i + 1] += starts[i];
-        }
-        (pixels, starts)
+        by_tick(pixels)
     })
 }
 
@@ -573,9 +770,9 @@ fn arc(canvas: &mut Canvas, mut live: Option<&mut Live>, of: impl Fn(usize) -> (
         let pick = |j: usize| ticks.get(j).filter(|(_, shape)| *shape == Shape::Short).map(|(c, _)| *c);
         let c = match ticks[i] {
             (c, Shape::Short) => c,
-            _ => pick(i.wrapping_sub(1)).or_else(|| pick(i + 1)).unwrap_or(colour(TRACK)),
+            _ => pick(i.wrapping_sub(1)).or_else(|| pick(i + 1)).unwrap_or(colour(track())),
         };
-        if unlit(c) { (colour(TRACK), false) } else { (c, true) }
+        if unlit(c) { (colour(track()), false) } else { (c, true) }
     };
     let slices: Vec<(Color, bool)> = (0..TICKS).map(band).collect();
     // What goes over the arc: its rounded ends, where it's lit, the knob and dot.
@@ -676,8 +873,8 @@ fn arc(canvas: &mut Canvas, mut live: Option<&mut Live>, of: impl Fn(usize) -> (
             }
         }
     }
-    let panel = canvas.panel;
-    let (pixels, starts) = arc_geometry();
+    let (panel, side) = (canvas.panel, canvas.side);
+    let (pixels, starts) = arc_geometry(side);
     for (tick, &(tint, lit)) in slices.iter().enumerate() {
         let u = canvas.colour(tint).to_color_u8();
         let colour = [u.red() as u16, u.green() as u16, u.blue() as u16, u.alpha() as u16];
@@ -708,7 +905,7 @@ fn arc(canvas: &mut Canvas, mut live: Option<&mut Live>, of: impl Fn(usize) -> (
             data[at] = blend(from[0], r);
             data[at + 1] = blend(from[1], g);
             data[at + 2] = blend(from[2], b);
-            let column = p.upright % SIZE;
+            let column = p.upright % side;
             (low, high) = (low.min(column), high.max(column));
         }
         if let (Some(live), true) = (live.as_deref_mut(), low <= high) {
@@ -723,7 +920,8 @@ fn arc(canvas: &mut Canvas, mut live: Option<&mut Live>, of: impl Fn(usize) -> (
         if let Some(live) = live.as_deref_mut() {
             let (rect, _) = &drawn;
             if again {
-                live.changed(rect.0.max(0) as u32, (rect.0 + rect.2 as i32).clamp(0, SIZE as i32) as u32);
+                let (x, _, w, _) = canvas.pixels(rect.0, rect.1, rect.2, rect.3);
+                live.changed(x.max(0) as u32, (x + w as i32).clamp(0, side as i32) as u32);
             }
             live.extras.push((key, drawn));
         }
@@ -733,41 +931,33 @@ fn arc(canvas: &mut Canvas, mut live: Option<&mut Live>, of: impl Fn(usize) -> (
 /// Works out both rings' shapes ahead of their first frame, which would
 /// otherwise wait for them (half a second on the unit).
 pub fn warm() {
-    let _ = (ring_geometry(), arc_geometry());
+    let _ = (ring_geometry(side()), arc_geometry(side()));
 }
 
-fn ring_geometry() -> &'static (Vec<RingPixel>, Vec<usize>) {
-    static GEOMETRY: std::sync::OnceLock<(Vec<RingPixel>, Vec<usize>)> = std::sync::OnceLock::new();
-    GEOMETRY.get_or_init(|| {
-        let mut pixels = ring_pixels_unsorted();
-        pixels.sort_by_key(|p| p.tick);
-        let mut starts = vec![0; TICKS + 1];
-        for p in &pixels {
-            starts[p.tick as usize + 1] += 1;
-        }
-        for i in 0..TICKS {
-            starts[i + 1] += starts[i];
-        }
-        (pixels, starts)
-    })
+fn ring_geometry(side: u32) -> &'static Geometry {
+    static CACHE: std::sync::Mutex<Vec<(u32, &'static Geometry)>> = std::sync::Mutex::new(Vec::new());
+    per_side(&CACHE, side, |side| by_tick(ring_pixels_unsorted(side)))
 }
 
-fn ring_pixels_unsorted() -> Vec<RingPixel> {
+fn ring_pixels_unsorted(side: u32) -> Vec<RingPixel> {
     {
         let mut pixels = Vec::new();
-        let (inner, outer) = (RING - MARK - 1.0, RING + 1.0);
+        let s = side as f32 / SIZE as f32;
+        let (centre, ring) = (side as f32 / 2.0, RING * s);
+        let (inner, outer) = (ring - MARK * s - 1.0, ring + 1.0);
         // Each tick a wedge, as the Nest's: `half` its half width at its
         // inner end and at the rim.
         let cover = |distance: f32, radius: f32, (inner, rim): (f32, f32), length: f32| {
-            let along_tick = ((radius - (RING - length)) / length).clamp(0.0, 1.0);
+            let (inner, rim, length) = (inner * s, rim * s, length * s);
+            let along_tick = ((radius - (ring - length)) / length).clamp(0.0, 1.0);
             let half = inner + (rim - inner) * along_tick;
             let across = (half + 0.5 - distance).clamp(0.0, 1.0);
-            let along = (radius - (RING - length) + 0.5).clamp(0.0, 1.0) * (RING + 0.5 - radius).clamp(0.0, 1.0);
+            let along = (radius - (ring - length) + 0.5).clamp(0.0, 1.0) * (ring + 0.5 - radius).clamp(0.0, 1.0);
             (across * along * 255.0).round() as u8
         };
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                let (dx, dy) = (x as f32 + 0.5 - CENTRE, y as f32 + 0.5 - CENTRE);
+        for y in 0..side {
+            for x in 0..side {
+                let (dx, dy) = (x as f32 + 0.5 - centre, y as f32 + 0.5 - centre);
                 let radius = (dx * dx + dy * dy).sqrt();
                 if radius < inner || radius > outer {
                     continue;
@@ -783,7 +973,7 @@ fn ring_pixels_unsorted() -> Vec<RingPixel> {
                 let (short, long) = (cover(distance, radius, (1.2, 1.2), TICK), cover(distance, radius, (2.3, 4.3), MARK));
                 let wide = cover(distance, radius, (2.8, 3.3), TICK);
                 if short > 0 || long > 0 || wide > 0 {
-                    pixels.push(RingPixel { upright: y * SIZE + x, panel: x * SIZE + (SIZE - 1 - y),
+                    pixels.push(RingPixel { upright: y * side + x, panel: x * side + (side - 1 - y),
                                             tick: tick as u8, short, long, wide });
                 }
             }
@@ -800,16 +990,22 @@ pub fn tick_at(fraction: f32) -> usize {
 /// A square RGB picture `size` wide, centred on (cx, cy), its corners
 /// rounded to `radius`.
 pub fn picture(canvas: &mut Canvas, rgb: &[u8], size: u32, cx: f32, cy: f32, radius: f32) {
+    picture_scaled(canvas, rgb, size, size, cx, cy, radius);
+}
+
+/// picture() in pixels: the picture drawn as it is, `size` pixels wide.
+fn picture_px(canvas: &mut Canvas, rgb: &[u8], size: u32, cx: f32, cy: f32, radius: f32) {
     let (x0, y0) = ((cx - size as f32 / 2.0).round() as i32, (cy - size as f32 / 2.0).round() as i32);
     let edge = size as f32 - radius;
+    let side = canvas.side as i32;
     for y in 0..size {
         let (py, fy) = (y0 + y as i32, y as f32 + 0.5);
-        if !(0..SIZE as i32).contains(&py) {
+        if !(0..side).contains(&py) {
             continue;
         }
         for x in 0..size {
             let (px, fx) = (x0 + x as i32, x as f32 + 0.5);
-            if !(0..SIZE as i32).contains(&px) {
+            if !(0..side).contains(&px) {
                 continue;
             }
             // How much of the pixel is inside the rounded corners.
@@ -837,19 +1033,21 @@ pub fn picture(canvas: &mut Canvas, rgb: &[u8], size: u32, cx: f32, cy: f32, rad
 
 /// A square picture `size` wide drawn `side` wide (no larger), centred on
 /// (cx, cy), over what's there: each pixel the average of those it covers,
-/// as solid as `alpha` says (all of it without).
+/// as solid as `alpha` says (all of it without). `side`, `cx` and `cy`
+/// are in units.
 pub fn picture_over(canvas: &mut Canvas, rgb: &[u8], alpha: Option<&[u8]>, size: u32, side: u32, cx: f32, cy: f32) {
-    let side = side.min(size).max(1);
+    let s = canvas.scale();
+    let (side, cx, cy, bound) = (((side as f32 * s).round() as u32).min(size).max(1), cx * s, cy * s, canvas.side as i32);
     let (x0, y0) = ((cx - side as f32 / 2.0).round() as i32, (cy - side as f32 / 2.0).round() as i32);
     for y in 0..side {
         let py = y0 + y as i32;
-        if !(0..SIZE as i32).contains(&py) {
+        if !(0..bound).contains(&py) {
             continue;
         }
         let (sy0, sy1) = (y * size / side, ((y + 1) * size / side).max(y * size / side + 1));
         for x in 0..side {
             let px = x0 + x as i32;
-            if !(0..SIZE as i32).contains(&px) {
+            if !(0..bound).contains(&px) {
                 continue;
             }
             let (sx0, sx1) = (x * size / side, ((x + 1) * size / side).max(x * size / side + 1));
@@ -884,9 +1082,17 @@ pub fn picture_over(canvas: &mut Canvas, rgb: &[u8], alpha: Option<&[u8]>, size:
 /// A square RGB picture `size` wide drawn `side` wide (smaller), each pixel
 /// the average of those it covers, centred on (cx, cy), corners rounded.
 pub fn picture_scaled(canvas: &mut Canvas, rgb: &[u8], size: u32, side: u32, cx: f32, cy: f32, radius: f32) {
-    if side >= size {
-        return picture(canvas, rgb, size, cx, cy, radius);
+    let s = canvas.scale();
+    let (pixels, cx, cy, radius) = (((side.min(size) as f32) * s).round() as u32, cx * s, cy * s, radius * s);
+    if pixels >= size {
+        return picture_px(canvas, rgb, size, cx, cy, radius);
     }
+    picture_px(canvas, &downsample(rgb, size, pixels), pixels, cx, cy, radius);
+}
+
+/// A square RGB picture `size` wide as `side` wide, each pixel the average
+/// of those it covers.
+fn downsample(rgb: &[u8], size: u32, side: u32) -> Vec<u8> {
     let mut small = Vec::with_capacity((side * side * 3) as usize);
     for y in 0..side {
         let (y0, y1) = (y * size / side, ((y + 1) * size / side).max(y * size / side + 1));
@@ -905,7 +1111,7 @@ pub fn picture_scaled(canvas: &mut Canvas, rgb: &[u8], size: u32, side: u32, cx:
             small.extend(sum.map(|v| (v / n) as u8));
         }
     }
-    picture(canvas, &small, side, cx, cy, radius);
+    small
 }
 
 /// A filled circle, its edge softened over a pixel: drawn pixel by pixel
@@ -918,8 +1124,10 @@ pub fn circle(canvas: &mut Canvas, cx: f32, cy: f32, r: f32, c: Color) {
     if a <= 0.0 || r <= 0.0 {
         return;
     }
-    let (x0, x1) = (((cx - r - 1.0).floor() as i32).max(0), ((cx + r + 1.0).ceil() as i32).min(SIZE as i32));
-    let (y0, y1) = (((cy - r - 1.0).floor() as i32).max(0), ((cy + r + 1.0).ceil() as i32).min(SIZE as i32));
+    let (s, side) = (canvas.scale(), canvas.side as i32);
+    let (cx, cy, r) = (cx * s, cy * s, r * s);
+    let (x0, x1) = (((cx - r - 1.0).floor() as i32).max(0), ((cx + r + 1.0).ceil() as i32).min(side));
+    let (y0, y1) = (((cy - r - 1.0).floor() as i32).max(0), ((cy + r + 1.0).ceil() as i32).min(side));
     for y in y0..y1 {
         let dy = y as f32 + 0.5 - cy;
         for x in x0..x1 {
@@ -1020,9 +1228,11 @@ pub fn pill(canvas: &mut Canvas, x: f32, y: f32, w: f32, h: f32, c: Color) {
 /// `chosen` (the rows as the highlight shows them) over `out` (as they show
 /// without it), the pill's rounded edge softened over a pixel.
 pub fn pill_window(out: &mut Canvas, chosen: &Canvas, x: f32, y: f32, w: f32, h: f32) {
+    let (s, side) = (out.scale(), out.side as i32);
+    let (x, y, w, h) = (x * s, y * s, w * s, h * s);
     let r = h / 2.0;
-    let (y0, y1) = ((y.floor() as i32).max(0), ((y + h).ceil() as i32).min(SIZE as i32));
-    let (x0, x1) = ((x.floor() as i32).max(0), ((x + w).ceil() as i32).min(SIZE as i32));
+    let (y0, y1) = ((y.floor() as i32).max(0), ((y + h).ceil() as i32).min(side));
+    let (x0, x1) = ((x.floor() as i32).max(0), ((x + w).ceil() as i32).min(side));
     let from = chosen.pixmap.data();
     for py in y0..y1 {
         let fy = py as f32 + 0.5;
@@ -1051,10 +1261,12 @@ pub fn pill_window(out: &mut Canvas, chosen: &Canvas, x: f32, y: f32, w: f32, h:
 /// `offset` runs from a row (`old` showing) to nothing (`new` in place).
 pub fn slide_band(out: &mut Canvas, old: &Canvas, new: &Canvas, top: f32, bottom: f32, offset: f32) {
     let pitch = if offset >= 0.0 { offset - crate::ui::screens::ROW_PITCH } else { offset + crate::ui::screens::ROW_PITCH };
-    let (top, bottom) = (top.max(0.0) as i32, (bottom as i32).min(SIZE as i32));
+    let (s, side) = (out.scale(), out.side);
+    let (top, bottom, offset, pitch) = (top * s, bottom * s, offset * s, pitch * s);
+    let (top, bottom) = (top.max(0.0) as i32, (bottom as i32).min(side as i32));
     let (shift, back) = (offset.round() as i32, pitch.round() as i32);
     let (from_new, from_old) = (new.pixmap.data(), old.pixmap.data());
-    for x in 0..SIZE {
+    for x in 0..side {
         for y in top..bottom {
             // Where this pixel comes from: the new rows if that's on the
             // band, else the old ones, which have moved on as far.
@@ -1072,21 +1284,24 @@ pub fn slide_band(out: &mut Canvas, old: &Canvas, new: &Canvas, top: f32, bottom
 /// moved `dx` to the right, at `opacity`: a device's option leaving the
 /// middle of its ring or arriving there. What's black on the layer leaves
 /// the canvas as it is. `columns` is where the layer has anything
-/// (columns_drawn): only those are gone over, on the unit's one slow core.
+/// (columns_drawn), in pixels: only those are gone over, on the unit's one
+/// slow core. `top`, `bottom` and `dx` are in units.
 pub fn slide_over(canvas: &mut Canvas, layer: &Canvas, columns: (u32, u32), top: u32, bottom: u32, dx: f32, opacity: f32) {
     let weight = (opacity.clamp(0.0, 1.0) * 255.0) as u16;
     if weight == 0 {
         return;
     }
-    let shift = dx.round() as i32;
+    let (s, side) = (canvas.scale(), canvas.side.min(layer.side));
+    let (top, bottom) = ((top as f32 * s).floor() as u32, ((bottom as f32 * s).ceil() as u32).min(side));
+    let shift = (dx * s).round() as i32;
     let from = layer.pixmap.data();
-    for sx in columns.0..columns.1.min(SIZE) {
+    for sx in columns.0..columns.1.min(side) {
         let x = sx as i32 + shift;
-        if x < 0 || x >= SIZE as i32 {
+        if x < 0 || x >= side as i32 {
             continue;
         }
         let x = x as u32;
-        for y in top..bottom.min(SIZE) {
+        for y in top..bottom {
             let source = layer.at(sx, y);
             let pixel = &from[source..source + 3];
             let most = *pixel.iter().max().unwrap_or(&0) as u16;
@@ -1105,22 +1320,36 @@ pub fn slide_over(canvas: &mut Canvas, layer: &Canvas, columns: (u32, u32), top:
 }
 
 /// The columns of `layer` (drawn on black) with anything on them between
-/// `top` and `bottom`: from the first to one past the last.
+/// `top` and `bottom`, in units: from the first to one past the last, in
+/// pixels.
 pub fn columns_drawn(layer: &Canvas, top: u32, bottom: u32) -> (u32, u32) {
+    let (s, side) = (layer.scale(), layer.side);
+    let (top, bottom) = ((top as f32 * s).floor() as u32, ((bottom as f32 * s).ceil() as u32).min(side));
     let data = layer.pixmap.data();
-    let drawn = |x: &u32| (top..bottom.min(SIZE)).any(|y| {
+    let drawn = |x: &u32| (top..bottom).any(|y| {
         let at = layer.at(*x, y);
         data[at..at + 3] != [0, 0, 0]
     });
-    match ((0..SIZE).find(drawn), (0..SIZE).rev().find(drawn)) {
+    match ((0..side).find(drawn), (0..side).rev().find(drawn)) {
         (Some(first), Some(last)) => (first, last + 1),
         _ => (0, 0),
     }
 }
 
+/// Text `size` units high as drawn: on a smaller panel (the gen 2's,
+/// physically smaller too) small text larger, up to a quarter, so it stays
+/// readable; large numbers as they are.
+fn larger(size: f32) -> f32 {
+    let side = if PANEL.load(std::sync::atomic::Ordering::Relaxed) { side() } else { preview_side() };
+    if side >= SIZE {
+        return size;
+    }
+    size * (1.0 + 0.25 * ((64.0 - size) / 36.0).clamp(0.0, 1.0))
+}
+
 /// `text`'s width at `size`, `spacing` added between letters.
 pub fn measure(font: &FontArc, size: f32, text: &str, spacing: f32) -> f32 {
-    let scaled = font.as_scaled(PxScale::from(size));
+    let scaled = font.as_scaled(PxScale::from(larger(size)));
     let mut width = 0.0;
     let mut previous = None;
     for c in text.chars() {
@@ -1184,7 +1413,7 @@ fn blend_mask(canvas: &mut Canvas, x: i32, y: i32, width: usize, mask: &[u8], c:
     }
     let c = canvas.rgb(c).map(|v| v as u16);
     let opacity = (opacity.clamp(0.0, 1.0) * 255.0) as u16;
-    let side = SIZE as i32;
+    let side = canvas.side as i32;
     for (row, line) in mask.chunks(width).enumerate() {
         let py = y + row as i32;
         if py < 0 || py >= side {
@@ -1212,14 +1441,17 @@ pub fn text_at(canvas: &mut Canvas, font: &FontArc, size: f32, x: f32, y: f32, t
     text_with(canvas, font, size, x, y, text, spacing, c, opacity, &mut Vec::new())
 }
 
-/// text_at, noting each glyph's rectangle (x, y, width, height).
+/// text_at, noting each glyph's rectangle (x, y, width, height) in pixels.
 #[allow(clippy::too_many_arguments)]
 fn text_with(canvas: &mut Canvas, font: &FontArc, size: f32, x: f32, y: f32, text: &str, spacing: f32,
              c: [u8; 3], opacity: f32, glyphs: &mut Vec<(i32, i32, usize, usize)>) -> f32 {
+    // Laid out in pixels, at the canvas's scale.
+    let s = canvas.scale();
+    let (size, spacing) = (larger(size) * s, spacing * s);
     let scaled = font.as_scaled(PxScale::from(size));
-    let mut x = x;
+    let mut x = x * s;
     let mut previous = None;
-    let baseline = y.round() as i32;
+    let baseline = (y * s).round() as i32;
     for ch in text.chars() {
         let id = scaled.glyph_id(ch);
         if let Some(p) = previous {
@@ -1236,7 +1468,7 @@ fn text_with(canvas: &mut Canvas, font: &FontArc, size: f32, x: f32, y: f32, tex
         x += scaled.h_advance(id);
         previous = Some(id);
     }
-    x
+    x / s
 }
 
 /// A line of words too long for its place, scrolling through it: `text`
@@ -1259,7 +1491,8 @@ pub struct Ticker<'a> {
 pub fn ticker(canvas: &mut Canvas, still: &Canvas, line: &Ticker, offset: f32) -> (u32, u32) {
     const FADE: i32 = 22;
     let (x0, x1) = (line.left.floor() as i32, (line.left + line.width).ceil() as i32);
-    let (top, height) = ((line.baseline - line.size * 1.05).floor() as i32, (line.size * 1.5).ceil() as usize);
+    let size = larger(line.size);
+    let (top, height) = ((line.baseline - size * 1.05).floor() as i32, (size * 1.5).ceil() as usize);
     canvas.restore(still, 0, top, SIZE as usize, height);
     // At rest its first letter stands clear of the faded end.
     let origin = line.left + FADE as f32 - offset;
@@ -1271,11 +1504,14 @@ pub fn ticker(canvas: &mut Canvas, still: &Canvas, line: &Ticker, offset: f32) -
     // Only in its window: the rest as it was, and the ends fading out.
     canvas.restore(still, 0, top, x0.max(0) as usize, height);
     canvas.restore(still, x1, top, (SIZE as i32 - x1).max(0) as usize, height);
-    let (y0, y1) = (top.max(0) as u32, (top + height as i32).clamp(0, SIZE as i32) as u32);
-    for step in 0..FADE {
-        let keep = (step as f32 + 0.5) / FADE as f32;
+    // The fade, in pixels.
+    let (x0, top, _, height) = canvas.pixels(x0, top, (x1 - x0).max(0) as usize, height);
+    let (x1, fade, side) = ((x1 as f32 * canvas.scale()).ceil() as i32, (FADE as f32 * canvas.scale()).round().max(1.0) as i32, canvas.side as i32);
+    let (y0, y1) = (top.max(0) as u32, (top + height as i32).clamp(0, side) as u32);
+    for step in 0..fade {
+        let keep = (step as f32 + 0.5) / fade as f32;
         for x in [x0 + step, x1 - 1 - step] {
-            if !(0..SIZE as i32).contains(&x) {
+            if !(0..side).contains(&x) {
                 continue;
             }
             for y in y0..y1 {
@@ -1288,7 +1524,7 @@ pub fn ticker(canvas: &mut Canvas, still: &Canvas, line: &Ticker, offset: f32) -
             }
         }
     }
-    (x0.clamp(0, SIZE as i32 - 1) as u32, (x1 - 1).clamp(0, SIZE as i32 - 1) as u32)
+    (x0.clamp(0, side - 1) as u32, (x1 - 1).clamp(0, side - 1) as u32)
 }
 
 /// Draws `text` centred on `cx`.
@@ -1324,6 +1560,8 @@ thread_local! {
 /// Draws an icon `size` across, centred on (cx, cy), from its coverage at
 /// that size, made once.
 pub fn icon(canvas: &mut Canvas, icon: Icon, cx: f32, cy: f32, size: f32, c: Color) {
+    let s = canvas.scale();
+    let (cx, cy, size) = (cx * s, cy * s, size * s);
     let key = (icon.path.as_ptr() as usize, size.to_bits());
     let mask = ICONS.with(|cache| cache.borrow().get(&key).cloned()).unwrap_or_else(|| {
         let made = std::rc::Rc::new(icon_mask(icon, size));
@@ -1361,13 +1599,17 @@ fn icon_mask(icon: Icon, size: f32) -> (usize, Vec<u8>) {
     (side as usize, pixmap.data().as_chunks::<4>().0.iter().map(|p| p[3]).collect())
 }
 
+/// A frame for the panel (device::Frame) as a canvas, taking its pixels.
+fn panel_canvas(frame: &mut Vec<u8>) -> Option<Canvas> {
+    let side = side();
+    let pixmap = Pixmap::from_vec(std::mem::take(frame), tiny_skia::IntSize::from_wh(side, side)?)?;
+    Some(Canvas { pixmap, panel: true, side })
+}
+
 /// A hint on a frame for the panel (device::Frame): a pill low on the
 /// display, its text centred.
 pub fn hint(frame: &mut Vec<u8>, fonts: &Fonts, text: &str) {
-    let Some(pixmap) = Pixmap::from_vec(std::mem::take(frame), tiny_skia::IntSize::from_wh(SIZE, SIZE).expect("480")) else {
-        return;
-    };
-    let mut canvas = Canvas { pixmap, panel: true };
+    let Some(mut canvas) = panel_canvas(frame) else { return };
     let width = measure(fonts.medium(), 19.0, text, 0.2) + 32.0;
     // Between the cards (their bottoms at 389) and the dots.
     pill(&mut canvas, CENTRE - width / 2.0, 399.0, width, 30.0, Color::from_rgba8(36, 38, 42, 255));
@@ -1400,6 +1642,22 @@ pub fn dots(canvas: &mut Canvas, count: usize, active: usize, y: f32, fade: f32)
     }
 }
 
+/// The chooser's dots over a full-size card, on a frame for the panel
+/// (device::Frame), where the cards don't zoom out (the gen 2): low on the
+/// display, on a dark band so they show over any card.
+pub fn chooser_dots(frame: &mut Vec<u8>, count: usize, active: usize) {
+    if count < 2 {
+        return;
+    }
+    let Some(mut canvas) = panel_canvas(frame) else { return };
+    let width = 15.0 * (count - 1) as f32 + 36.0;
+    pill(&mut canvas, CENTRE - width / 2.0, CHOOSER_DOTS_AT - 11.0, width, 22.0, Color::from_rgba8(0, 0, 0, 150));
+    dots(&mut canvas, count, active, CHOOSER_DOTS_AT, 1.0);
+    *frame = canvas.pixmap.take();
+}
+/// Where chooser_dots go: as low as the round display is wide enough.
+const CHOOSER_DOTS_AT: f32 = 438.0;
+
 /// The chosen card's name above the zoomed-out cards (their tops at 91),
 /// where the display is wide enough for a long one, and the dots below.
 const TITLE_BASELINE: f32 = 68.0;
@@ -1429,10 +1687,7 @@ fn title_size(fonts: &Fonts, name: &str) -> (f32, f32) {
 /// under them at `fade`.
 pub fn around_cards(frame: &mut Vec<u8>, fonts: &Fonts, name: &str, title: f32, count: usize, active: usize,
                     fade: f32) {
-    let Some(pixmap) = Pixmap::from_vec(std::mem::take(frame), tiny_skia::IntSize::from_wh(SIZE, SIZE).expect("480")) else {
-        return;
-    };
-    let mut canvas = Canvas { pixmap, panel: true };
+    let Some(mut canvas) = panel_canvas(frame) else { return };
     if title > 0.01 {
         let (size, room) = title_size(fonts, name);
         let name = fit(fonts.medium(), size, name, 0.0, room);

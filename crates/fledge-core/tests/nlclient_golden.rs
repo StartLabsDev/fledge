@@ -403,6 +403,12 @@ fn unsupported_relocations_and_branch_veneers_are_refused() {
                  "native_pthread_create", "native_usleep", "native_getpid"] {
         externals.entry(name.into()).or_insert(stub);
     }
+    externals.entry("native_fb_present".into()).or_insert(0);
+    externals.entry("native_pr_create_thread".into()).or_insert(0);
+    externals.entry("native_mmap".into()).or_insert(0);
+    for key in nlclient::discovery::FB_LAYOUT {
+        externals.insert(format!("layout_{key}"), 0);
+    }
     let layout: BTreeMap<String, u32> =
         serde_json::from_value(golden["discovery"]["layout"].clone()).unwrap();
     externals.extend(layout.into_iter().map(|(k, v)| (format!("layout_{k}"), v)));
@@ -508,7 +514,12 @@ fn reviewed_builds_share_their_natives_library_calls() {
             .filter(|(name, calls)| !others.iter().any(|v| v["imports"][name.as_str()] == json!(calls)))
             .map(|(name, _)| name.as_str())
             .collect();
-        let allowed = if own == "2025-6.5-14" { 5 } else { 1 };
+        // The gen 2 alone presents through the framebuffer (native_fb_present).
+        let allowed = match own.as_str() {
+            "2025-6.5-14" => 5,
+            "2019-gen2" => 2,
+            _ => 1,
+        };
         assert!(unmatched.len() <= allowed, "{}: no other reviewed build's natives call what these do: {unmatched:?}", path.display());
     }
 }

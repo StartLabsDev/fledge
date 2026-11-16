@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fledge-core", "crates/fledge-host", "crates/fledge-cli", "crates/fledge-gui", "crates/nestlocal"]
+members = ["crates/fledge-core", "crates/fledge-host", "crates/fledge-cli", "crates/fledge-gui", "crates/fledge-pixels", "crates/nestlocal"]
 
 [workspace.package]
 edition = "2021"
@@ -26,6 +26,13 @@ opt-level = 3
 opt-level = 3
 
 [profile.thermostat.package.ab_glyph_rasterizer]
+opt-level = 3
+
+# And the UI's own per-pixel loops (fledge-pixels): the gen 2's core turns,
+# composes, overlays and scales each frame itself. nestlocal itself stays
+# at "s": built whole for speed it is 1.6 MB larger, more than a gen 2's
+# root slot can spare beside an update.
+[profile.thermostat.package.fledge-pixels]
 opt-level = 3
 
 [profile.dev.package.rsa]

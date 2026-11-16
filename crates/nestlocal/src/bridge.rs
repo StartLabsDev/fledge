@@ -67,9 +67,11 @@ const SENSOR_ENTITIES: [(&str, &str); 2] = [("sensor", "external_temperature"), 
 /// What stays announced while the Nest isn't a thermostat (role.rs): what
 /// it senses and what keeps it, besides the motion sensors; nothing that
 /// controls or reports heating.
-const PANEL_ENTITIES: [&str; 14] = ["wwn_boiler_option", "current_temperature", "current_humidity", "backplate_temperature", "battery_level",
+const PANEL_ENTITIES: [&str; 24] = ["wwn_boiler_option", "current_temperature", "current_humidity", "backplate_temperature", "battery_level",
     "rssi", "local_ip", "occupancy", "light_level", "infrared_light", "external_power", "backplate_input_voltage",
-    "temperature_scale", "act_as_thermostat"];
+    "temperature_scale", "act_as_thermostat",
+    "memory_used", "memory_left", "nest_page_faults", "memory_pressure", "cards_paused", "resume_cards",
+    "nest_app_restarts", "nest_app_trouble", "ui_frame_typical", "ui_frame_slowest"];
 
 /// Whether the entity `key` stays announced while the Nest isn't a thermostat.
 fn on_a_panel(key: &str) -> bool {
@@ -328,6 +330,16 @@ impl Bridge {
         }
         let payload = serde_json::json!({"visible": visible, "infrared": infrared}).to_string();
         self.publish(&format!("{}/light", self.base), true, payload.as_bytes());
+    }
+
+    /// The memory's reading from health.rs (the gen 2's), on <base>/memory.
+    fn publish_memory(&self, reading: &crate::health::Reading, faults: u64, level: crate::health::Level, paused: bool) {
+        let megabytes = |kb: u64| (kb as f64 / 102.4).round() / 10.0;
+        let payload = serde_json::json!({
+            "used": megabytes(reading.own_kb), "left": megabytes(reading.free_kb),
+            "faults": faults, "level": level.name(), "cards_paused": paused,
+        }).to_string();
+        self.publish(&format!("{}/memory", self.base), true, payload.as_bytes());
     }
 
     /// The backplate's power from motion.rs, on <base>/power (retained: the
@@ -750,6 +762,77 @@ impl Bridge {
             });
         }
 
+        // How smooth the UI is in use (ui::Ui::frame_report): a minute's
+        // typical and slowest frame while it animates.
+        let frames = format!("{}/ui/frames", self.base);
+        for (key, name, field, icon) in [
+            ("ui_frame_typical", "Screen frame time", "typical", "mdi:timer-outline"),
+            ("ui_frame_slowest", "Slowest screen frame", "slowest", "mdi:timer-alert-outline"),
+        ] {
+            add("sensor", key, name, fields!{
+                "state_topic" => frames.clone(),
+                "value_template" => format!("{{{{ value_json.{field} }}}}"),
+                "unit_of_measurement" => "ms",
+                "device_class" => "duration",
+                "state_class" => "measurement",
+                "entity_category" => "diagnostic",
+                "icon" => icon,
+            });
+        }
+
+        // nlclient's restarts (nest_app.rs), on both generations.
+        let nest_app = format!("{}/nest_app", self.base);
+        add("sensor", "nest_app_restarts", "Nest app restarts (24 h)", fields!{
+            "state_topic" => nest_app.clone(),
+            "value_template" => "{{ value_json.restarts_day }}",
+            "state_class" => "measurement",
+            "entity_category" => "diagnostic",
+            "icon" => "mdi:restart",
+        });
+        add("binary_sensor", "nest_app_trouble", "Nest app restarting", fields!{
+            "state_topic" => nest_app,
+            "value_template" => "{{ 'ON' if value_json.trouble else 'OFF' }}",
+            "device_class" => "problem",
+            "entity_category" => "diagnostic",
+        });
+
+        // The gen 2's memory (health.rs): what it has to spare is what its
+        // cards and nlclient share.
+        if crate::device::current().generation == 2 {
+            let memory = format!("{}/memory", self.base);
+            for (key, name, field, unit, icon) in [
+                ("memory_used", "Fledgeling memory", "used", "MB", "mdi:memory"),
+                ("memory_left", "Memory left", "left", "MB", "mdi:memory"),
+                ("nest_page_faults", "Nest page faults", "faults", "/s", "mdi:harddisk"),
+            ] {
+                add("sensor", key, name, fields!{
+                    "state_topic" => memory.clone(),
+                    "value_template" => format!("{{{{ value_json.{field} }}}}"),
+                    "unit_of_measurement" => unit,
+                    "state_class" => "measurement",
+                    "entity_category" => "diagnostic",
+                    "icon" => icon,
+                });
+            }
+            add("sensor", "memory_pressure", "Memory pressure", fields!{
+                "state_topic" => memory.clone(),
+                "value_template" => "{{ value_json.level }}",
+                "entity_category" => "diagnostic",
+                "icon" => "mdi:gauge",
+            });
+            add("binary_sensor", "cards_paused", "Cards paused", fields!{
+                "state_topic" => memory,
+                "value_template" => "{{ 'ON' if value_json.cards_paused else 'OFF' }}",
+                "device_class" => "problem",
+                "entity_category" => "diagnostic",
+            });
+            add("button", "resume_cards", "Resume cards", fields!{
+                "command_topic" => format!("{set}resume_cards"),
+                "entity_category" => "config",
+                "icon" => "mdi:play-circle-outline",
+            });
+        }
+
         let sw = |add: &mut dyn FnMut(&str, &str, &str, Fields), key: &str, name: &str, icon: &str| {
             add("switch", key, name, fields!{
                 "value_template" => on_off(key),
@@ -803,8 +886,8 @@ impl Bridge {
         }
 
         let number_entity = |add: &mut dyn FnMut(&str, &str, &str, Fields), key: &str, name: &str,
-                             min: f64, max: f64, step: f64, unit: &str| {
-            add("number", key, name, fields!{
+                             min: f64, max: f64, step: f64, unit: &str, class: &str| {
+            let mut c = fields!{
                 "value_template" => tmpl(key),
                 "command_topic" => format!("{set}{key}"),
                 "min" => num(min),
@@ -813,16 +896,21 @@ impl Bridge {
                 "unit_of_measurement" => unit,
                 "entity_category" => "config",
                 "mode" => "box",
-            });
+            };
+            // Home Assistant converts a temperature to its own unit system only with the class.
+            if !class.is_empty() {
+                c.insert("device_class".into(), class.into());
+            }
+            add("number", key, name, c);
         };
         if can_heat {
-            number_entity(&mut add, "away_temperature_low", "Eco heat temperature", ECO_LOW.0, ECO_LOW.1, 0.5, "°C");
+            number_entity(&mut add, "away_temperature_low", "Eco heat temperature", ECO_LOW.0, ECO_LOW.1, 0.5, "°C", "temperature");
         }
         if can_cool {
-            number_entity(&mut add, "away_temperature_high", "Eco cool temperature", ECO_HIGH.0, ECO_HIGH.1, 0.5, "°C");
+            number_entity(&mut add, "away_temperature_high", "Eco cool temperature", ECO_HIGH.0, ECO_HIGH.1, 0.5, "°C", "temperature");
         }
         if truthy(dev.get("has_humidifier")) || truthy(dev.get("has_dehumidifier")) {
-            number_entity(&mut add, "target_humidity", "Target humidity", 10.0, 60.0, 5.0, "%");
+            number_entity(&mut add, "target_humidity", "Target humidity", 10.0, 60.0, 5.0, "%", "");
             sw(&mut add, "target_humidity_enabled", "Humidity control", "mdi:water-percent");
         }
         if truthy(dev.get("has_air_filter")) {
@@ -1184,7 +1272,26 @@ pub fn state(dev: &Fields, sh: &Fields) -> Fields {
 }
 
 /// The home screen cards' commands, to Home Assistant's nest_ui blueprint.
+impl crate::nest_app::Report for Bridge {
+    /// nlclient's restarts (nest_app.rs), on <base>/nest_app.
+    fn nest_app(&self, running: bool, restarts_day: usize, trouble: bool) {
+        let payload = serde_json::json!({"running": running, "restarts_day": restarts_day, "trouble": trouble}).to_string();
+        self.publish(&format!("{}/nest_app", self.base), true, payload.as_bytes());
+    }
+}
+
+impl crate::health::Report for Bridge {
+    fn memory(&self, reading: &crate::health::Reading, faults: u64, level: crate::health::Level, paused: bool) {
+        self.publish_memory(reading, faults, level, paused);
+    }
+}
+
 impl crate::ui::Sender for Bridge {
+    fn ui_frames(&self, slowest_ms: u32, typical_ms: f32) {
+        let payload = serde_json::json!({"slowest": slowest_ms, "typical": (typical_ms * 10.0).round() / 10.0}).to_string();
+        self.publish(&format!("{}/ui/frames", self.base), true, payload.as_bytes());
+    }
+
     fn send(&self, command: &crate::ui::Command) {
         let payload = command.payload().to_string();
         // An alarm's code is never logged.
@@ -1234,6 +1341,11 @@ impl crate::ui::Sender for Bridge {
 
     fn nest_command(&self, name: &str, arg: &str) {
         self.command(&format!("{}/set/{name}", self.base), arg.as_bytes());
+    }
+
+    fn nudge_nlclient(&self) {
+        let now = chrono::Utc::now().timestamp_millis();
+        self.store.merge(&format!("device.{}", self.serial), &fields!{"fledge_keeper" => now}, 0, 0, false);
     }
 }
 
@@ -1360,6 +1472,9 @@ pub mod tests {
         assert!(configs.contains_key("homeassistant/binary_sensor/nestlocal_s/heating/config"));
         assert!(!configs.contains_key("homeassistant/binary_sensor/nestlocal_s/cooling/config"));
         assert!(configs.contains_key("homeassistant/select/nestlocal_s/fan_timer_duration/config"));
+        let eco: Value = serde_json::from_str(&configs["homeassistant/number/nestlocal_s/away_temperature_low/config"]).unwrap();
+        assert_eq!((&eco["unit_of_measurement"], &eco["device_class"]), (&json!("°C"), &json!("temperature")),
+                   "Home Assistant shows it in its own unit");
     }
 
     #[test]
@@ -1568,6 +1683,19 @@ pub mod tests {
             // The heating times read their own topic, the rest the state's.
             let (want, keys) = if c["state_topic"] == json!("nestlocal/S/heating_times") {
                 ("nestlocal/S/heating_times", schedule_keys.clone())
+            } else if c["state_topic"] == json!("nestlocal/S/ui/frames") {
+                let fields = match json!({"slowest": 30, "typical": 20.5}) {
+                    Value::Object(o) => o,
+                    _ => unreachable!(),
+                };
+                ("nestlocal/S/ui/frames", fields)
+            } else if c["state_topic"] == json!("nestlocal/S/nest_app") {
+                // nest_app.rs's, as Bridge::nest_app publishes it.
+                let fields = match json!({"running": true, "restarts_day": 0, "trouble": false}) {
+                    Value::Object(o) => o,
+                    _ => unreachable!(),
+                };
+                ("nestlocal/S/nest_app", fields)
             } else {
                 ("nestlocal/S/state", s.clone())
             };
@@ -1760,7 +1888,7 @@ pub mod tests {
             let configs = b.announced.lock().unwrap().clone().unwrap();
             configs.contains_key("homeassistant/switch/nestlocal_s/wwn_boiler_option/config")
         };
-        assert!(has("Display-3.4") && has("Display-5.1"));
-        assert!(!has("Display-2.9"));
+        assert!(has("Display-2.12") && has("Display-3.4") && has("Display-5.1"));
+        assert!(!has("Display-1.10"));
     }
 }

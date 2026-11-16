@@ -1,0 +1,18 @@
+{
+  "climate-set@320": 0.22,
+  "climate-set@480": 0.25,
+  "climate@320": 0.22,
+  "climate@480": 0.27,
+  "dim@320": 0.1,
+  "dim@480": 0.2,
+  "lights@320": 0.09,
+  "lights@480": 0.29,
+  "list@320": 0.03,
+  "list@480": 0.05,
+  "media@320": 0.1,
+  "media@480": 0.2,
+  "settings@320": 0.02,
+  "settings@480": 0.05,
+  "volume@320": 0.09,
+  "volume@480": 0.2
+}

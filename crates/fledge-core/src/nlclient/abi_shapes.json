@@ -545,6 +545,9 @@
     "ACTIVITY_QUEUE_OFFSET": 420,
     "BUCKET_GLOBALS_OFFSET": 4,
     "COMMON_OFFSET": 164,
+    "FB_FD_OFFSET": 4,
+    "FB_MAP_OFFSET": 240,
+    "FB_SIZE_OFFSET": 236,
     "GLOBALS_TIMER_OFFSET": 184,
     "LAYER_COMMON_VPTR": 204,
     "LAYER_SECOND_VPTR": 336,
@@ -577,6 +580,7 @@
     "native_config_layout": "63693c5c76c65936b8968c4c94380294d1be10d0b5d3aa6a8cbe7a135ea33db4",
     "native_config_y": "6dfd24c275a83d0d8f7036242f0fdcffb43b8aa2bd862c6df7f1c71debd2866e",
     "native_device_commit": "b27f215377a8b34a9af7a2f6cc7ff8c36684c35661a14975d1c0b8f4af60bd0e",
+    "native_fb_present": "d50b7d23f6984b6cf5c6f083b748ea8cd0d5a956477666d70619566b72f24afe",
     "native_image_height": "71de2c273dd76c776ed9786783d36f4456a1db07dda88f7b46a623470e120b52",
     "native_image_load": "5cea9d1b18fa0b6de1085c6be0a3ecca1050bdec40dda1e53d205a785c24cc9a",
     "native_image_width": "8de8a896eba63c8b343fa5fe8898d831b298840a07646cd6281698f18c957120",
@@ -650,6 +654,9 @@
      "_ZNK8nlString13GetAsUTFArrayEv",
      "_Znwj",
      "nlGetNowInSeconds"
+    ],
+    "native_fb_present": [
+     "ioctl"
     ],
     "native_image_height": [],
     "native_image_load": [

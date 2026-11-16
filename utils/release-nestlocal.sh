@@ -24,7 +24,8 @@
 # the tag as its version (git describe), and built in the firmware build image
 # on macOS, as utils/build-firmware.sh does (it needs one full build first).
 # The release holds nestlocal-armv7, nestlocal-armv7.sig (a raw 64-byte
-# Ed25519 signature of the file) and nestlocal-armv7.sha256. Publishing pushes
+# Ed25519 signature of the file) and nestlocal-armv7.sha256, and nestlocal.gen2
+# where it runs a gen 2's cards (a gen 2 is offered no other). Publishing pushes
 # the tag to origin and creates the release with gh as GitHub's active
 # account, marked latest. Needs OpenSSL 3 (brew install openssl@3).
 set -eu
@@ -109,6 +110,12 @@ untag() { [ $published = 1 ] || git tag -d "$tag" > /dev/null 2>&1 || true; }
 trap untag EXIT
 
 # --- build -----------------------------------------------------------------------
+# The thermostats heat a home and aren't for testing on: what each screen
+# costs to draw is checked here against the baseline recorded on this Mac
+# (crates/nestlocal/src/testdata/draw-times.json; see ui::shots::draw_times).
+echo "Checking the screens' draw times (log: $log)"
+cargo test --release -p nestlocal ui::shots::draw_times -- --ignored --nocapture >> "$log" 2>&1 ||
+    { grep -E "slower to draw|panicked" "$log" | tail -n 3 >&2; fail "a screen draws much slower than before"; }
 echo "Building nestlocal (log: $log)"
 if [ "$(uname -s)" = Darwin ]; then
     docker build -q -t unfr0zen-build - < utils/ci/Dockerfile >> "$log" 2>&1 || { tail -n 20 "$log" >&2; fail "docker build"; }
@@ -123,6 +130,13 @@ binary=$out/nestlocal-armv7
 cp build/nestlocal-armv7 "$binary"
 grep -a -q -- "nestlocal/$tag" "$binary" || grep -a -q -- "$tag" "$binary" || fail "the build does not report $tag"
 ! grep -a -q -- "$tag-dirty" "$binary" || fail "the build reports $tag-dirty"
+# A gen 2's root slot (47 MB, about 22 MB of it nestlocal's to use) holds the
+# running nestlocal, kept for rollback, beside the update and 1 MB to spare
+# (update.rs): an update larger than this could not be installed there.
+max_bytes=9961472
+size=$(wc -c < "$binary" | tr -d ' ')
+[ "$size" -le $max_bytes ] ||
+    fail "nestlocal is $size bytes, over the $max_bytes a 2nd generation Nest can install (Cargo.toml's thermostat profile)"
 
 # --- sign --------------------------------------------------------------------------
 "$openssl" pkeyutl -sign -rawin -inkey "$key" -in "$binary" -out "$binary.sig"
@@ -161,7 +175,15 @@ case $tag in
     *-rc.*|*-beta.*|*-alpha.*) channel=--prerelease ;;
     *) channel=--latest ;;
 esac
+# A gen 2 is offered only releases holding nestlocal.gen2 (update.rs): those
+# built with its cards and memory watch (crates/nestlocal/src/health.rs).
+gen2=
+if [ -f crates/nestlocal/src/health.rs ]; then
+    gen2=$out/nestlocal.gen2
+    echo "This release's nestlocal runs a 2nd generation Nest's cards." > "$gen2"
+fi
+# shellcheck disable=SC2086
 gh release create "$tag" --repo "$repo" --verify-tag "$channel" --title "Fledge $tag" \
-    --notes-file "$out/notes.md" "$binary" "$binary.sig" "$binary.sha256" ||
+    --notes-file "$out/notes.md" "$binary" "$binary.sig" "$binary.sha256" $gen2 ||
     fail "the tag is pushed but the release was not created: gh release create $tag --repo $repo ..."
 echo "Released: https://github.com/$repo/releases/tag/$tag"

@@ -2034,6 +2034,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fledge-pixels"
+version = "0.1.0"
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3451,6 +3455,7 @@ dependencies = [
  "embassy-time",
  "embassy-time-driver",
  "embassy-time-queue-utils",
+ "fledge-pixels",
  "futures-lite",
  "http-body",
  "http-body-util",

@@ -313,6 +313,9 @@ extern int native_kill(int, int);
 #define SCREEN_OWNER "/var/run/unfr0zen/screen.owner"
 static int read_pid(const char *path);
 static int read_owner(int *beat);
+static int exists(const char *path);
+static void write_pid(const char *path);
+extern int native_getpid(void);
 static int screen_owned(void) {
     int beat;
     int pid = read_owner(&beat);
@@ -321,6 +324,62 @@ static int screen_owned(void) {
 u32 custom_swap(void *display, void *surface) {
     if (screen_owned()) return 1; /* EGL_TRUE: drawn, not shown */
     return native_egl_swap(display, surface);
+}
+/* The gen 2 has no EGL: nlclient draws into /dev/fb0's two pages itself, in
+ * its own mapping of them, and shows each frame through one method that
+ * flips its page and pans to the drawn one (FBIOPAN_DISPLAY), then waits for
+ * vsync. While the display is owned that method is skipped, and where
+ * discovery found the mapping's fields (FB_MAP_OFFSET), private memory is
+ * mapped over it in place: nlclient draws unseen, so the UI has both pages
+ * to flip between and nothing of nlclient's lands on its frames. FB_PRIVATE
+ * tells the UI so. The private pages start as a copy of fb0, and go back to
+ * it whole when the display is handed back, before nlclient's present shows
+ * its newest frame: what it drew meanwhile isn't lost. The sleep stands in
+ * for the vsync wait, longer than one so nlclient leaves the core to the UI. */
+extern int native_fb_present(void *, void *);
+extern int native_usleep(unsigned int);
+extern void *native_mmap(void *, unsigned int, int, int, int, int);
+extern const u8 layout_FB_FD_OFFSET __attribute__((visibility("hidden")));
+#define FB_FD_OFFSET LAYOUT(FB_FD_OFFSET)
+extern const u8 layout_FB_MAP_OFFSET __attribute__((visibility("hidden")));
+#define FB_MAP_OFFSET LAYOUT(FB_MAP_OFFSET)
+extern const u8 layout_FB_SIZE_OFFSET __attribute__((visibility("hidden")));
+#define FB_SIZE_OFFSET LAYOUT(FB_SIZE_OFFSET)
+#define FB_PRIVATE "/var/run/unfr0zen/fb.private"
+#define FB_DEVICE "/dev/fb0"
+#define PROT_READ_WRITE 3
+#define MAP_SHARED_FIXED 0x11
+#define MAP_PRIVATE_FIXED_ANONYMOUS 0x32
+#define OWNED_WAIT 100000
+static void fb_copy(void *map, unsigned int size, int out) {
+    void *file = native_fopen(FB_DEVICE, out ? "wb" : "rb");
+    if (!file) return;
+    if (out) native_fwrite(map, 1, size, file);
+    else native_fread(map, 1, size, file);
+    native_fclose(file);
+}
+int custom_present(void *fb, void *pages) {
+    void *map = FB_MAP_OFFSET ? PTR(fb, FB_MAP_OFFSET) : 0;
+    unsigned int size = map ? WORD(fb, FB_SIZE_OFFSET) : 0;
+    if (screen_owned()) {
+        /* FB_PRIVATE holds the pid of the nlclient whose mapping is
+         * private: one left by an nlclient since restarted is not this one's. */
+        if (map && size && read_pid(FB_PRIVATE) != native_getpid()) {
+            void *mapped = native_mmap(map, size, PROT_READ_WRITE, MAP_PRIVATE_FIXED_ANONYMOUS, -1, 0);
+            if (mapped == map) {
+                fb_copy(map, size, 0);
+                write_pid(FB_PRIVATE);
+            }
+        }
+        native_usleep(OWNED_WAIT);
+        return 0;
+    }
+    if (map && size && read_pid(FB_PRIVATE) == native_getpid()
+        && !rename_setting(FB_PRIVATE, "/var/run/unfr0zen/fb.shared")) {
+        fb_copy(map, size, 1);
+        native_mmap(map, size, PROT_READ_WRITE, MAP_SHARED_FIXED, WORD(fb, FB_FD_OFFSET), 0);
+    }
+    return native_fb_present(fb, pages);
 }
 /* While the UI owns the display, nlclient sees none of the ring and button,
  * so it would let its display go dark. A thread of nlclient's own lights it
@@ -334,7 +393,11 @@ u32 custom_swap(void *display, void *surface) {
  * STALE_TICKS of the thread running (time awake: suspended, neither runs);
  * a hung owner's file is moved aside, so nlclient presents again. KEEPER_RESTS
  * tells the UI this build knows both. */
-extern int native_pthread_create(void *, void *, void *(*)(void *), void *);
+/* nlclient imports one of the two thread starts; the other links as 0. */
+extern int native_pthread_create(void *, void *, void *(*)(void *), void *) __attribute__((visibility("hidden")));
+/* NSPR's PR_CreateThread(type, start, arg, priority, scope, state, stack). */
+extern void *native_pr_create_thread(unsigned int, void (*)(void *), void *, unsigned int,
+                                     unsigned int, unsigned int, unsigned int);
 extern int native_usleep(unsigned int);
 extern int native_getpid(void);
 #define DISPLAY_WAKE "/var/run/unfr0zen/display.wake"
@@ -367,6 +430,9 @@ static void *keeper(void *globals) {
     }
     return 0;
 }
+static void keeper_nspr(void *globals) {
+    keeper(globals);
+}
 /* The owner's pid, and its heartbeat after a space (-1 without one). */
 static int read_owner(int *beat) {
     char text[32];
@@ -393,24 +459,34 @@ static int read_pid(const char *path) {
     for (int i = 0; i < count && text[i] >= '0' && text[i] <= '9'; i++) pid = pid * 10 + (text[i] - '0');
     return pid;
 }
-/* Once per nlclient: the payload has no writable data, so the mark that the
- * thread runs is this process's pid in KEEPER. */
-static void keeper_start(void *bucket) {
-    if (!HANDOVER) return;
+/* This process's pid, as the file's whole text. */
+static void write_pid(const char *path) {
     int pid = native_getpid();
-    if (read_pid(KEEPER) == pid) return;
     char text[12];
     int length = 0;
     for (int rest = pid; rest; rest /= 10) length++;
     for (int i = length, rest = pid; i > 0; rest /= 10) text[--i] = '0' + rest % 10;
-    void *file = native_fopen(KEEPER, "w");
+    void *file = native_fopen(path, "w");
     if (!file) return;
     native_fwrite(text, 1, length, file);
     native_fclose(file);
+}
+/* Once per nlclient: the payload has no writable data, so the mark that the
+ * thread runs is this process's pid in KEEPER. */
+static void keeper_start(void *bucket) {
+    if (!HANDOVER) return;
+    if (read_pid(KEEPER) == native_getpid()) return;
+    write_pid(KEEPER);
     void *rests = native_fopen(KEEPER_RESTS, "w");
     if (rests) native_fclose(rests);
     unsigned int thread;
-    native_pthread_create(&thread, 0, keeper, PTR(bucket, BUCKET_GLOBALS_OFFSET));
+    /* Opaque to the compiler, which takes a linked function for nonzero. */
+    void *pthread_create = (void *)native_pthread_create;
+    __asm__("" : "+r"(pthread_create));
+    if (pthread_create)
+        native_pthread_create(&thread, 0, keeper, PTR(bucket, BUCKET_GLOBALS_OFFSET));
+    else /* a user thread, normal priority, global scope, unjoinable */
+        native_pr_create_thread(0, keeper_nspr, PTR(bucket, BUCKET_GLOBALS_OFFSET), 1, 1, 1, 0);
 }
 /* What nlclient shows, as nlclient itself tells it. Every change of its
  * screen, view or a screen's active layer goes through one telemetry report

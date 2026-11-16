@@ -19,7 +19,8 @@ pub const DEFAULT_NTP_SERVER: &str = "pool.ntp.org";
 const NTP_LINES: [(&str, &str); 2] = [("etc/ntp.conf", "server "), ("etc/connman/main.conf", "FallbackTimeservers = ")];
 /// nlclient's backplate simulator: run it as 1H1C with made-up temperature and humidity.
 const BACKPLATE_SIM: [&str; 3] = ["backplatesimulationrun", "backplatesimulationhvactype", "backplatesimulatetempandhum"];
-/// A Heat Link model (Display-3.x, Display-5.x) whose radio nestlocal holds
+/// A Heat Link model (the gen 2's Display-2.x, the gen 3's Display-3.x and
+/// Display-5.x) wired to its boiler, or whose radio nestlocal holds,
 /// has no Heat Link any more: nlclient would block on its loss. Asked for,
 /// rcS sets using_wwn_boiler in nlclient's settings before it starts, so it
 /// runs as heating a Works With Nest boiler through W1 instead: on, every
@@ -33,7 +34,7 @@ const WWN_BEGIN: &str = "# unfr0zen: Works With Nest boiler\n";
 const WWN_END: &str = "# unfr0zen: end\n";
 const WWN_SETTINGS: &str = "/media/user-config/settings.config";
 const WWN_MARKER: &str = "/media/user-config/.unfr0zen-wwn-boiler";
-const WWN_ON: &str = r#"case "$(fw_printenv -n nlmodel 2>/dev/null)" in Display-3.*|Display-5.*)
+const WWN_ON: &str = r#"case "$(fw_printenv -n nlmodel 2>/dev/null)" in Display-2.*|Display-3.*|Display-5.*)
   [ -f SETTINGS ] || printf '%s\n' '<?xml version="1.0" encoding="ISO-8859-1"?>' '<settings>' '</settings>' > SETTINGS
   touch MARKER
   sed -i -e '/<s key="using_wwn_boiler" /d' -e 's|^</settings>|  <s key="using_wwn_boiler" value="1"/>\n</settings>|' SETTINGS
@@ -1608,7 +1609,7 @@ mod tests {
         let rcs = volume.text("etc/init.d/rcS");
         let block = &rcs[rcs.find(WWN_BEGIN).unwrap()..rcs.find(WWN_END).unwrap() + WWN_END.len()];
         assert_eq!(rcs.replace(block, ""), without);
-        assert!(block.contains("case \"$(fw_printenv -n nlmodel 2>/dev/null)\" in Display-3.*|Display-5.*)\n"));
+        assert!(block.contains("case \"$(fw_printenv -n nlmodel 2>/dev/null)\" in Display-2.*|Display-3.*|Display-5.*)\n"));
         assert!(block.contains("  touch /media/user-config/.unfr0zen-wwn-boiler\n"));
         assert!(block.contains(r#"<s key="using_wwn_boiler" value="1"/>"#) && !block.contains("SETTINGS") && !block.contains("MARKER"));
         // Before nestlocal's line, which keeps its place right before

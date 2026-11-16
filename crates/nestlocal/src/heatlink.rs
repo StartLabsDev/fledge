@@ -27,9 +27,11 @@ pub const CHOICE: &str = "/media/user-config/.fledge-wwn-boiler";
 pub const MARKER: &str = "/media/user-config/.unfr0zen-wwn-boiler";
 pub const RCS: &str = "/etc/init.d/rcS";
 
-/// Whether a model has a Heat Link to miss: gen3 Display-3.x and Display-5.x.
+/// Whether a model has a Heat Link to miss: the gen 2's Display-2.x (its
+/// 5.9 firmware reads using_wwn_boiler too) and the gen 3's Display-3.x and
+/// Display-5.x.
 pub fn heat_link_model(model: &str) -> bool {
-    model.starts_with("Display-3.") || model.starts_with("Display-5.")
+    ["Display-2.", "Display-3.", "Display-5."].iter().any(|m| model.starts_with(m))
 }
 
 /// FNV-1a: the same on every build, unlike std's hasher.
@@ -157,7 +159,8 @@ mod tests {
     #[test]
     fn heat_link_models() {
         assert!(heat_link_model("Display-3.4") && heat_link_model("Display-5.1"));
-        assert!(!heat_link_model("Display-2.9") && !heat_link_model(""));
+        assert!(heat_link_model("Display-2.12"), "the gen 2 looks for one too");
+        assert!(!heat_link_model("Display-1.10") && !heat_link_model(""));
     }
 
     #[test]
