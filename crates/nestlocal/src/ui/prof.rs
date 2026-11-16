@@ -20,10 +20,12 @@ pub enum Part {
     Copy,
     Pan,
     Read,
+    /// The chooser's card name and dots, as text drawn over the cards.
+    Title,
 }
 
-pub const PARTS: usize = 8;
-const NAMES: [&str; PARTS] = ["draw", "round", "shrink", "compose", "overlay", "copy", "pan", "read"];
+pub const PARTS: usize = 9;
+const NAMES: [&str; PARTS] = ["draw", "round", "shrink", "compose", "overlay", "copy", "pan", "read", "title"];
 
 static SPENT: [AtomicU32; PARTS] = [const { AtomicU32::new(0) }; PARTS];
 

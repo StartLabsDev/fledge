@@ -272,10 +272,18 @@ fn fledge_theme(kept: Option<&str>) -> bool {
     kept.is_none_or(|kept| kept.trim() != "nest")
 }
 
-/// Whether the cards only ever show full size, sliding side by side: the
-/// gen 2's 58 MB can't keep each zoomed out too (a frame is 900 KB), nor its
-/// core compose them as the ring turns.
+/// Kept on a gen 2 for its cards to show only full size, sliding side by
+/// side, with dots for the chooser: where zooming out is too slow or its
+/// memory too tight.
+const NO_ZOOM: &str = "/media/data/fledge-no-zoom";
+
+/// Whether the cards only ever show full size (NO_ZOOM on a gen 2).
 fn full_size_only() -> bool {
+    low_memory() && std::path::Path::new(NO_ZOOM).exists()
+}
+
+/// Whether frames must be counted: the gen 2's 58 MB.
+fn low_memory() -> bool {
     crate::device::current().generation == 2
 }
 
@@ -283,7 +291,7 @@ fn full_size_only() -> bool {
 /// the gen 2, fewer as its memory gets tight (health.rs). A turn from one
 /// card to the next needs two.
 fn frame_budget() -> usize {
-    if !full_size_only() {
+    if !low_memory() {
         return usize::MAX;
     }
     match crate::health::level() {
@@ -1494,7 +1502,7 @@ impl Runtime {
         let nearest = at.round().clamp(0.0, count as f32 - 1.0) as usize;
         let title = fade * (1.0 - 2.0 * (at - at.round()).abs()).clamp(0.0, 1.0);
         let name = self.name(nearest);
-        prof::time(prof::Part::Overlay, || {
+        prof::time(prof::Part::Title, || {
             paint::around_cards(&mut self.scratch, &self.fonts, &name, title, count as usize, nearest, fade);
             if self.machine.hint {
                 paint::hint(&mut self.scratch, &self.fonts, "Turn to browse · press to open");
@@ -2595,6 +2603,40 @@ mod tests {
         rgb.chunks(3).flat_map(|c| [c[2], c[1], c[0], 0]).collect()
     }
 
+    /// A gen 2 screen as captured (upright, 320 pixels) as a Frame.
+    fn gen2_frame(bytes: &[u8]) -> Vec<u8> {
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+        let mut rgb = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut rgb).unwrap();
+        assert_eq!((info.width, info.height, info.color_type), (320, 320, png::ColorType::Rgb));
+        let mut frame = vec![0u8; 320 * 320 * 4];
+        for y in 0..320 {
+            for x in 0..320 {
+                let c = &rgb[(y * 320 + x) * 3..][..3];
+                frame[x * 1280 + (319 - y) * 4..][..4].copy_from_slice(&[c[2], c[1], c[0], 0]);
+            }
+        }
+        frame
+    }
+
+    #[test]
+    fn the_gen_2_s_screens_are_told_apart() {
+        // Ben's gen 2, 2026-11-16 (nlclient 5.9.4-5).
+        let dial_ = gen2_frame(include_bytes!("../testdata/gen2-dial.png"));
+        let back = gen2_frame(include_bytes!("../testdata/gen2-menu-back.png"));
+        let settings = gen2_frame(include_bytes!("../testdata/gen2-menu-settings.png"));
+        let eco = gen2_frame(include_bytes!("../testdata/gen2-menu-eco.png"));
+        let tile = gen2_frame(include_bytes!("../testdata/gen2-settings-tile.png"));
+        let done = gen2_frame(include_bytes!("../testdata/gen2-settings-done.png"));
+        assert!(dial(&dial_), "its dial");
+        for other in [&back, &settings, &eco, &tile, &done] {
+            assert!(!dial(other), "no other screen is the dial");
+        }
+        assert!(back_chosen(&back) && !back_chosen(&settings) && !back_chosen(&eco) && !back_chosen(&dial_));
+        assert!(settings_chosen(&settings) && !settings_chosen(&back) && !settings_chosen(&eco));
+        assert!(!dial(&vec![0; dial_.len()]), "black is not the dial");
+    }
+
     #[test]
     fn nlclient_s_dial_is_known_while_the_thermostat_is_off() {
         // Ben's unit, 2026-11-10: off, 23.5 °C now, Eco's leaf; no ring of ticks.
@@ -2874,22 +2916,57 @@ fn gen3_page(page: &[u8]) -> bool {
     page.len() == 480 * 480 * 4
 }
 
-/// A gen 2's frame of nlclient's (320 pixels across) scaled up to the gen
-/// 3's 480, where the checks of what nlclient shows were made: its screens
-/// are laid out the same, smaller. Any other frame as it is.
-fn as_gen3(page: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    const SMALL: usize = 320;
-    if page.len() != SMALL * SMALL * 4 {
-        return std::borrow::Cow::Borrowed(page);
+/// nlclient's screens on the gen 2 (5.9's, 320 pixels across), told by
+/// their pixels as measured on Ben's unit, 2026-11-16: its dial is a band of
+/// ticks across the top, its menu a row of icons along the bottom (Back's
+/// arrow, Settings' cog, ...) whose chosen one is lit white, its Settings
+/// teal tiles. The gen 3's checks don't hold for them.
+mod gen2 {
+    const SIDE: usize = 320;
+
+    pub fn page(page: &[u8]) -> bool {
+        page.len() == SIDE * SIDE * 4
     }
-    let mut big = vec![0u8; 480 * 480 * 4];
-    for (y, line) in big.as_chunks_mut::<{ 480 * 4 }>().0.iter_mut().enumerate() {
-        let from = &page[y * SMALL / 480 * SMALL * 4..][..SMALL * 4];
-        for (x, pixel) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            pixel.copy_from_slice(&from[x * SMALL / 480 * 4..][..4]);
+
+    /// Upright (x, y)'s red, green and blue: a Frame's row x, column
+    /// SIDE - 1 - y, as BGRX (device::Display::take).
+    fn rgb(page: &[u8], x: usize, y: usize) -> [u8; 3] {
+        let at = x * SIDE * 4 + (SIDE - 1 - y) * 4;
+        [page[at + 2], page[at + 1], page[at]]
+    }
+
+    fn white_in(page: &[u8], xs: std::ops::Range<usize>, ys: std::ops::Range<usize>) -> usize {
+        xs.flat_map(|x| ys.clone().map(move |y| (x, y))).filter(|&(x, y)| rgb(page, x, y).iter().all(|&c| c > 200)).count()
+    }
+
+    /// The dial: across the top, most angles have a tick, lit at five or
+    /// more of the band's radii (it measures 0.97 and more; any other
+    /// screen, 0.07 or less).
+    pub fn dial(page: &[u8]) -> bool {
+        let (mut hit, mut total) = (0, 0);
+        for angle in (200..341).step_by(2) {
+            let (sin, cos) = (angle as f32).to_radians().sin_cos();
+            let lit = (128..152).step_by(3).filter(|&r| {
+                let (x, y) = ((160.0 + r as f32 * cos) as usize, (160.0 + r as f32 * sin) as usize);
+                rgb(page, x, y).iter().max().copied().unwrap_or(0) > 70
+            }).count();
+            total += 1;
+            hit += (lit >= 5) as u32;
         }
+        hit * 2 > total
     }
-    std::borrow::Cow::Owned(big)
+
+    /// The menu with Back chosen (as it opens): its arrow, bottom left, lit
+    /// white (about 600 pixels; none with anything else chosen).
+    pub fn back_chosen(page: &[u8]) -> bool {
+        white_in(page, 50..98, 222..272) > 300
+    }
+
+    /// The menu with Settings chosen: its cog, right of the arrow, lit white
+    /// (about 380 pixels).
+    pub fn settings_chosen(page: &[u8]) -> bool {
+        white_in(page, 103..153, 254..292) > 200
+    }
 }
 
 fn dial_page(page: &[u8]) -> bool {
@@ -2915,7 +2992,9 @@ fn menu_shows(display: &mut device::Display) -> bool {
 /// middle, black near the edge above and below it (a cooling dial is blue
 /// all over).
 fn settings_tile(page: &[u8]) -> bool {
-    let page = &*as_gen3(page);
+    if gen2::page(page) {
+        return false; // the gen 2's: unmeasured, and its dial check needs neither
+    }
     if !gen3_page(page) {
         return false;
     }
@@ -2950,7 +3029,9 @@ fn settings_tile(page: &[u8]) -> bool {
 /// Whether nlclient's menu shows with Back chosen: its arrow, lower left,
 /// blue (unchosen it is grey).
 fn back_chosen(page: &[u8]) -> bool {
-    let page = &*as_gen3(page);
+    if gen2::page(page) {
+        return gen2::back_chosen(page);
+    }
     if !gen3_page(page) {
         return false;
     }
@@ -2970,7 +3051,9 @@ fn back_chosen(page: &[u8]) -> bool {
 /// Whether nlclient's menu shows Settings chosen: its cog, below the
 /// date, lit white.
 fn settings_chosen(page: &[u8]) -> bool {
-    let page = &*as_gen3(page);
+    if gen2::page(page) {
+        return gen2::settings_chosen(page);
+    }
     if !gen3_page(page) {
         return false;
     }
@@ -2993,7 +3076,9 @@ fn blank(page: &[u8]) -> bool {
 
 /// Whether a frame shows nlclient's home dial: its ring lit around the edge.
 fn dial(page: &[u8]) -> bool {
-    let page = &*as_gen3(page);
+    if gen2::page(page) {
+        return gen2::dial(page);
+    }
     if !gen3_page(page) {
         return false;
     }
@@ -3019,7 +3104,9 @@ fn dial(page: &[u8]) -> bool {
 /// middle, and nothing else white (its menus have white icons round the
 /// edge, its Settings tiles are blue).
 fn off_dial(page: &[u8]) -> bool {
-    let page = &*as_gen3(page);
+    if gen2::page(page) {
+        return false; // the gen 2's: unmeasured, and its dial check needs neither
+    }
     if !gen3_page(page) {
         return false;
     }
