@@ -3278,6 +3278,13 @@ mod shots {
         };
         let fonts = paint::Fonts::load(&fonts).unwrap();
         paint::set_theme(if std::env::var("UNFR0ZEN_UI_THEME").is_ok_and(|t| t == "nest") { paint::Theme::Nest } else { paint::Theme::Fledge });
+        // UNFR0ZEN_UI_FACE=navy or black: Fledge's look on another face than
+        // its own (black with glow).
+        paint::set_face_style(match std::env::var("UNFR0ZEN_UI_FACE").as_deref() {
+            Ok("navy") => paint::FaceStyle::Navy,
+            Ok("black") => paint::FaceStyle::Black,
+            _ => paint::FaceStyle::BlackGlow,
+        });
         // UNFR0ZEN_UI_SIDE=320: as the gen 2's panel shows them.
         if let Some(side) = std::env::var("UNFR0ZEN_UI_SIDE").ok().and_then(|s| s.parse().ok()) {
             paint::preview_at(side);

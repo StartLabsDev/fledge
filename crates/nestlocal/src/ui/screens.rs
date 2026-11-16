@@ -1787,7 +1787,7 @@ pub fn glance_still(fonts: &Fonts, at: &GlanceIn) -> Canvas {
             let size = 30.0;
             let words = paint::measure(fonts.regular(), size, &said.text, 0.0).min(slot.room);
             let (width, height) = (words + 36.0, 46.0);
-            let face = if paint::fledge() { paint::FACE } else { BLACK };
+            let face = if paint::fledge() { paint::face_colour() } else { BLACK };
             paint::pill(&mut p, HALF - width / 2.0, slot.y - size * 0.36 - height / 2.0, width, height, alpha(face, 0.82));
         }
         glance_line(&mut p, fonts, slot, &said, coloured);

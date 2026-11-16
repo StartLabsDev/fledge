@@ -96,15 +96,57 @@ pub fn fledge() -> bool {
 }
 
 /// Fledge's face, its ring's track, and its list highlight.
-pub const FACE: [u8; 3] = [9, 13, 21];
-pub const TRACK: [u8; 3] = [27, 35, 48];
+const NAVY_FACE: [u8; 3] = [9, 13, 21];
+const NAVY_TRACK: [u8; 3] = [27, 35, 48];
 /// The lift in the middle of Fledge's face: a deep blue.
 const FACE_LIFT: [u8; 3] = [22, 31, 48];
-const FLEDGE_SELECT: [u8; 3] = [58, 68, 86];
+const NAVY_SELECT: [u8; 3] = [58, 68, 86];
+/// On a black face: the same, neutral.
+const BLACK_TRACK: [u8; 3] = [34, 34, 37];
+const BLACK_SELECT: [u8; 3] = [58, 58, 62];
+
+/// Fledge's face: navy lifted with blue in the middle, or black (with only
+/// heating's or cooling's glow, or none), as the device's own black glass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FaceStyle {
+    Navy = 0,
+    Black = 1,
+    BlackGlow = 2,
+}
+
+/// Fledge's look is black with glow (Ben, 2026-11-16: the navy read as a
+/// screen, not part of the device).
+static FACE_STYLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(FaceStyle::BlackGlow as u8);
+
+pub fn set_face_style(style: FaceStyle) {
+    FACE_STYLE.store(style as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn face_style() -> FaceStyle {
+    match FACE_STYLE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => FaceStyle::Black,
+        2 => FaceStyle::BlackGlow,
+        _ => FaceStyle::Navy,
+    }
+}
+
+/// Fledge's face colour, under its glow.
+pub fn face_colour() -> [u8; 3] {
+    if face_style() == FaceStyle::Navy { NAVY_FACE } else { BLACK }
+}
+
+/// A ring's unlit track in Fledge's look.
+fn track() -> [u8; 3] {
+    if face_style() == FaceStyle::Navy { NAVY_TRACK } else { BLACK_TRACK }
+}
 
 /// A list's highlight, in the theme's colour.
 pub fn select() -> [u8; 3] {
-    if fledge() { FLEDGE_SELECT } else { SELECT }
+    match (fledge(), face_style()) {
+        (false, _) => SELECT,
+        (true, FaceStyle::Navy) => NAVY_SELECT,
+        (true, _) => BLACK_SELECT,
+    }
 }
 
 /// A screen's face: `background` whole (the Nest's), or Fledge's dark face
@@ -117,15 +159,22 @@ pub fn face(background: [u8; 3]) -> Canvas {
     if !fledge() {
         return canvas(background);
     }
-    type Key = ([u8; 3], bool, u32);
+    let style = face_style();
+    if style == FaceStyle::Black || style == FaceStyle::BlackGlow && background == BLACK {
+        // Nothing to glow: plain black, no cached copy to keep.
+        return canvas(BLACK);
+    }
+    type Key = ([u8; 3], bool, u32, u8);
     static FACES: std::sync::Mutex<Vec<(Key, Canvas)>> = std::sync::Mutex::new(Vec::new());
-    let key = (background, PANEL.load(std::sync::atomic::Ordering::Relaxed), side());
+    let key = (background, PANEL.load(std::sync::atomic::Ordering::Relaxed), side(), style as u8);
     let mut faces = FACES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, face)) = faces.iter().find(|(k, _)| *k == key) {
         return face.clone();
     }
-    let mut p = canvas(FACE);
-    glow(&mut p, FACE_LIFT, 240.0, 210.0, 330.0, 0.7);
+    let mut p = canvas(face_colour());
+    if style == FaceStyle::Navy {
+        glow(&mut p, FACE_LIFT, 240.0, 210.0, 330.0, 0.7);
+    }
     if background != BLACK {
         // Cooling glows a lighter, cyan-leaning blue, near as strongly as
         // heating's orange: COOL itself reads dark and muddy as a glow.
@@ -135,6 +184,10 @@ pub fn face(background: [u8; 3]) -> Canvas {
             other => (other, 0.42),
         };
         glow(&mut p, c, 240.0, 272.0, 300.0, strength);
+        if style == FaceStyle::BlackGlow {
+            // Black by the glass's edge (radius 240), as the bezel is.
+            fade_edge(&mut p, 150.0, 226.0);
+        }
     }
     // A few backgrounds in all (black, heating, cooling): the oldest goes
     // once there are more.
@@ -143,6 +196,32 @@ pub fn face(background: [u8; 3]) -> Canvas {
     }
     faces.push((key, p.clone()));
     p
+}
+
+/// Darkens toward black from `inner` out from the middle of the display to
+/// black at `outer` (on SIZE's scale), smoothly: a face's glow ends inside
+/// the round glass, which then meets the device's black bezel unbroken.
+fn fade_edge(p: &mut Canvas, inner: f32, outer: f32) {
+    let (s, side) = (p.scale(), p.side);
+    let (centre, inner, outer) = (CENTRE * s, inner * s, outer * s);
+    let panel = p.panel;
+    let data = p.pixmap.data_mut();
+    for y in 0..side {
+        let dy = y as f32 + 0.5 - centre;
+        for x in 0..side {
+            let dx = x as f32 + 0.5 - centre;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d <= inner {
+                continue;
+            }
+            let t = ((d - inner) / (outer - inner)).clamp(0.0, 1.0);
+            let keep = 1.0 - t * t * (3.0 - 2.0 * t);
+            let at = 4 * if panel { x * side + (side - 1 - y) } else { y * side + x } as usize;
+            for k in 0..3 {
+                data[at + k] = (data[at + k] as f32 * keep).round() as u8;
+            }
+        }
+    }
 }
 
 /// A soft radial glow of `c` round (cx, cy), `radius` out, `strength` (0..1)
@@ -674,9 +753,9 @@ fn arc(canvas: &mut Canvas, mut live: Option<&mut Live>, of: impl Fn(usize) -> (
         let pick = |j: usize| ticks.get(j).filter(|(_, shape)| *shape == Shape::Short).map(|(c, _)| *c);
         let c = match ticks[i] {
             (c, Shape::Short) => c,
-            _ => pick(i.wrapping_sub(1)).or_else(|| pick(i + 1)).unwrap_or(colour(TRACK)),
+            _ => pick(i.wrapping_sub(1)).or_else(|| pick(i + 1)).unwrap_or(colour(track())),
         };
-        if unlit(c) { (colour(TRACK), false) } else { (c, true) }
+        if unlit(c) { (colour(track()), false) } else { (c, true) }
     };
     let slices: Vec<(Color, bool)> = (0..TICKS).map(band).collect();
     // What goes over the arc: its rounded ends, where it's lit, the knob and dot.
