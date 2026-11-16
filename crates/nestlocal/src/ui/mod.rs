@@ -1041,10 +1041,14 @@ impl Runtime {
                     // 4 ms; nlclient, drawing aside, waits 100 ms a frame
                     // meanwhile (custom_present).
                     if crate::device::current().generation == 2 {
-                        // Twice as long as the frame while its memory is
-                        // tight: nlclient is reading its pages back.
-                        let tight = crate::health::level() != crate::health::Level::Calm;
-                        std::thread::sleep(if tight { took * 2 } else { (took / 4).max(Duration::from_millis(4)) });
+                        // As long as the frame while its memory is tight,
+                        // twice as long when critical: nlclient is reading
+                        // its pages back.
+                        std::thread::sleep(match crate::health::level() {
+                            crate::health::Level::Calm => (took / 4).max(Duration::from_millis(4)),
+                            crate::health::Level::Tight => took,
+                            crate::health::Level::Critical => took * 2,
+                        });
                     }
                     let shown = Instant::now();
                     if let Some(gap) = self.paced.0.map(|last| shown.duration_since(last)).filter(|gap| *gap < LULL) {
@@ -1906,15 +1910,25 @@ impl Runtime {
                 // The gen 2's nlclient may take that press only to wake its
                 // display (the UI held it at rest): its dial shows, and a
                 // second press, on the dial, opens the menu.
-                let mut pressed_again = !gen2::page(&self.display.save());
+                // While it wakes it may not take a press at all: up to two
+                // more, each once its dial has shown for a second.
+                let small = gen2::page(&self.display.save());
+                let (mut presses, mut dial_since) = (1, None::<Instant>);
+                let started = Instant::now();
                 while !menu_shows(&mut self.display) {
-                    if !pressed_again && waiting.elapsed() > Duration::from_millis(700) && dial(&self.display.save()) {
-                        pressed_again = true;
-                        logf!("ui: nlclient's dial, not its menu: pressing again");
-                        self.input.press();
-                        waiting = Instant::now();
+                    if small {
+                        let shows = dial(&self.display.save());
+                        dial_since = if shows { dial_since.or(Some(Instant::now())) } else { None };
+                        if presses < 3 && dial_since.is_some_and(|since| since.elapsed() > Duration::from_millis(1000)) {
+                            presses += 1;
+                            logf!("ui: nlclient's dial, not its menu: pressing again ({presses})");
+                            self.input.press();
+                            dial_since = None;
+                            waiting = Instant::now();
+                        }
                     }
-                    if waiting.elapsed() > Duration::from_millis(if pressed_again { 2500 } else { 1500 }) {
+                    let limit = if small { started.elapsed() > Duration::from_millis(7000) } else { waiting.elapsed() > Duration::from_millis(1500) };
+                    if limit {
                         logf!("ui: nlclient's menu didn't show: left as it is");
                         return;
                     }

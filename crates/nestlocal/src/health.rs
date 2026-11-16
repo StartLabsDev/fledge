@@ -66,9 +66,10 @@ const CRITICAL_FREE_KB: u64 = 3_000;
 const TIGHT_FAULTS: u64 = 20;
 const CRITICAL_FAULTS: u64 = 80;
 /// nestlocal's own memory at which the level rises, and at which it stops
-/// itself. Using the cards it measured 12 to 14 MB; at 22 the unit restarted.
-const OWN_TIGHT_KB: u64 = 17_000;
-const OWN_CRITICAL_KB: u64 = 20_000;
+/// itself. Using the cards it measured 12 to 14 MB, zooming out 17 to 18
+/// (Ben's unit, 2026-11-16: 21 MB left, no faults); at 22 the unit restarted.
+const OWN_TIGHT_KB: u64 = 19_500;
+const OWN_CRITICAL_KB: u64 = 22_000;
 const OWN_HARD_KB: u64 = 26_000;
 /// Readings a level is held for before it falls.
 const HOLD: u32 = 3;
@@ -336,8 +337,9 @@ mod tests {
     fn little_memory_left_or_a_grown_nestlocal_raise_the_level() {
         assert_eq!(judge(&reading(8_000, 5_000, 0), 0), Level::Tight);
         assert_eq!(judge(&reading(8_000, 2_500, 0), 0), Level::Critical);
-        assert_eq!(judge(&reading(18_000, 14_000, 0), 0), Level::Tight);
-        assert_eq!(judge(&reading(21_000, 14_000, 0), 0), Level::Critical);
+        assert_eq!(judge(&reading(18_000, 14_000, 0), 0), Level::Calm, "zoomed out, room to spare");
+        assert_eq!(judge(&reading(20_000, 14_000, 0), 0), Level::Tight);
+        assert_eq!(judge(&reading(22_500, 14_000, 0), 0), Level::Critical);
         assert_eq!(judge(&reading(13_000, 14_000, 0), 5), Level::Calm, "as measured using the cards");
     }
 
