@@ -110,8 +110,8 @@ screens come back for Nest's dial and More Nest settings.
 ## Supported thermostats
 
 **Fledge supports the Nest Learning Thermostat (3rd and 2nd generation).**
-2nd generation support is new and in release candidates: see below for what
-has been tested.
+2nd generation support is new in v0.11.0: see below for what has been
+tested.
 
 > [!IMPORTANT]
 > **Not supported: the Nest Learning Thermostat (1st generation), the Nest
