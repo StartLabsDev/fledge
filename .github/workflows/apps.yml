@@ -72,9 +72,19 @@ jobs:
       - name: Submodules
         run: git submodule update --init --depth 1 platform/diamond3/uboot/upstream platform/common/doom/doomgeneric
 
-      # The 1st and 2nd generation's x-loader and kernel aren't built: the app
-      # turns those Nests away (device::unsupported_thermostat), and their old
-      # Ubuntu build containers no longer reach Ubuntu's archive.
+      # The OMAP boards' x-loader, without which the app can't reach a 2nd
+      # generation Nest. Its Ubuntu 14.04 build container doesn't resolve
+      # Ubuntu's archive on these runners, so the one platform/j49/xloader.sh
+      # built from Nest's 5.9.4 source is kept beside it (it differs from a
+      # fresh build only in its build-date string). build-firmware.sh then
+      # finds it up to date. The j49 kernel is still skipped: only --usb-shell
+      # needs it.
+      - name: The j49's x-loader
+        run: |
+          sha256sum -c platform/j49/x-load.bin.sha256
+          mkdir -p build/j49
+          cp platform/j49/x-load.bin build/j49/x-load.bin
+          touch build/j49/x-load.bin
 
       - name: Everything else, in the build image
         env:
@@ -85,6 +95,9 @@ jobs:
           docker run --rm -v "$PWD:$PWD" -w "$PWD" -e JOBS=4 -e CARGO_HOME="$PWD/.work/cargo" \
             -e UNFR0ZEN_BUILD_VERSION="$TAG" "$IMAGE" \
             sh -c 'git config --global --add safe.directory "$PWD" && utils/build-firmware.sh'
+
+      - name: The app can reach a 2nd generation Nest
+        run: cmp platform/j49/x-load.bin build/j49/x-load.bin
 
       - name: Logs
         if: failure()
