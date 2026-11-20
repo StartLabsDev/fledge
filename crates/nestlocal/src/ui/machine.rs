@@ -134,6 +134,10 @@ pub const LIGHTING: Duration = Duration::from_millis(1500);
 /// The thermostat's target goes to nlclient once the ring has rested this
 /// long, not at every step: each change is a bucket write it acts on.
 pub const SETTLE: Duration = Duration::from_millis(700);
+/// An open screen's number follows its device once the ring has rested
+/// this long: a change made elsewhere (a phone, an automation) shows, and
+/// one the hand just made has gone out and come back first.
+pub const FOLLOW_AFTER: Duration = Duration::from_secs(2);
 /// How long a media player's volume shows large after the ring turns.
 pub const VOLUME_SHOWN: Duration = Duration::from_millis(1500);
 /// How long the thermostat's dial says "Heat set to" after the ring turns.
@@ -2096,7 +2100,60 @@ impl Machine {
         }
     }
 
-    /// A climate's dial, on its target as it is now.
+    /// The open screen's number as its device has it now, while the ring
+    /// rests: what the screen was opened on, or the hand set, is not held
+    /// against a change made elsewhere. What the hand sent stands on the
+    /// card until Home Assistant catches up (apply_sent), so it doesn't
+    /// jump back; the count (D3) takes the number to where it is.
+    fn follow(&mut self) {
+        if self.pending.is_some() || self.turn != 0 || self.floor.is_some() {
+            return;
+        }
+        let next = match self.mode {
+            Mode::Dial { of, target } => {
+                let Some(card) = self.climate(of) else { return };
+                let Some(is) = card.target.map(|t| on_step(t, card.step)) else { return };
+                if is == on_step(target, card.step) {
+                    return;
+                }
+                // A part step the hand left on the mark goes with it.
+                self.dial_offset = 0.0;
+                Mode::Dial { of, target: is }
+            }
+            Mode::LightDim { slot, light, .. } => match self.card(slot) {
+                Some(Card::Lights(card)) if light < card.lights.len() => self.dimmer(slot, light),
+                _ => return,
+            },
+            Mode::LightWarmth { slot, light, value } => match self.card(slot) {
+                Some(Card::Lights(card)) => match card.lights.get(light).and_then(|l| l.kelvin) {
+                    Some(k) => Mode::LightWarmth { slot, light, value: k },
+                    None => Mode::LightWarmth { slot, light, value },
+                },
+                _ => return,
+            },
+            Mode::LightHue { slot, light, value } => match self.card(slot) {
+                Some(Card::Lights(card)) => match card.lights.get(light).and_then(|l| l.hue) {
+                    Some(h) => Mode::LightHue { slot, light, value: (h % 360).min(HUE_MAX) },
+                    None => Mode::LightHue { slot, light, value },
+                },
+                _ => return,
+            },
+            Mode::Volume { slot, value } => match self.card(slot) {
+                Some(Card::Media(card)) => Mode::Volume { slot, value: card.volume.unwrap_or(value) },
+                _ => return,
+            },
+            Mode::CoverSet { slot, value } => match self.card(slot) {
+                Some(Card::Cover(card)) => Mode::CoverSet { slot, value: card.position.unwrap_or(value) },
+                _ => return,
+            },
+            _ => return,
+        };
+        if next != self.mode {
+            self.mode = next;
+            self.dirty = true;
+        }
+    }
+
     /// A light's dimmer, as it is now.
     fn dimmer(&self, slot: usize, light: usize) -> Mode {
         let (on, value) = match self.card(slot) {
@@ -2490,6 +2547,9 @@ impl Machine {
             self.dirty = true;
         }
         let idle = now.duration_since(self.last_input);
+        if idle >= FOLLOW_AFTER && now.duration_since(self.last_sent) >= FOLLOW_AFTER {
+            self.follow();
+        }
         if !lit {
             // Out: the next light starts with the backlight on, as nlclient's own.
             self.kept_dark = false;
@@ -3995,6 +4055,47 @@ mod tests {
         assert_eq!(sent(&rig.press()), vec![("target".into(), "9".into())], "a press sends it, then its menu");
         rig.press();
         assert_eq!(rig.machine.mode, Mode::Chooser(0), "its menu's Back");
+    }
+
+    #[test]
+    fn an_open_dial_follows_a_target_set_elsewhere_once_the_ring_rests() {
+        let mut rig = nest_rig();
+        rig.press();
+        assert_eq!(rig.machine.mode, Mode::Dial { of: Dial::Nest, target: 20.0 });
+        // Set from a phone while the dial shows.
+        rig.machine.set_nest(nest(serde_json::json!({"target": 23.0})));
+        rig.wait(FOLLOW_AFTER);
+        assert_eq!(rig.machine.mode, Mode::Dial { of: Dial::Nest, target: 23.0 });
+        // The hand's own setting isn't taken back by the state before it.
+        rig.turn(-CLIMATE_STEP * 2);
+        assert_eq!(rig.machine.mode, Mode::Dial { of: Dial::Nest, target: 22.0 });
+        rig.wait(SETTLE);
+        rig.machine.set_nest(nest(serde_json::json!({"target": 23.0})));
+        rig.wait(FOLLOW_AFTER / 2);
+        assert_eq!(rig.machine.mode, Mode::Dial { of: Dial::Nest, target: 22.0 }, "too soon after the hand");
+        rig.machine.set_nest(nest(serde_json::json!({"target": 22.0})));
+        rig.wait(FOLLOW_AFTER * 2);
+        assert_eq!(rig.machine.mode, Mode::Dial { of: Dial::Nest, target: 22.0 });
+    }
+
+    #[test]
+    fn an_open_climate_dial_and_volume_follow_home_assistant() {
+        let mut rig = Rig::woken();
+        let changed = |target: f64, volume: u8| Cards::parse(format!(r#"{{"cards":[
+            {{"kind":"lights","name":"Bedroom","icon":"","lights":[
+                {{"id":"light.lamp","name":"Lamp","on":true,"dimmable":true,"brightness":60}},
+                {{"id":"switch.fan","name":"Fan","on":false,"dimmable":false}}]}},
+            {{"kind":"climate","id":"climate.kitchen","name":"Kitchen","target":{target},"min":7,"max":30,"step":0.5}},
+            {{"kind":"media","id":"media_player.speaker","name":"Speaker","state":"playing","volume":{volume}}}],
+            "wake":"chooser"}}"#).as_bytes()).unwrap();
+        rig.machine.mode = Mode::Dial { of: Dial::Card(1), target: 19.0 };
+        rig.machine.set_cards(changed(21.0, 30), &mut vec![]);
+        rig.wait(FOLLOW_AFTER);
+        assert_eq!(rig.machine.mode, Mode::Dial { of: Dial::Card(1), target: 21.0 });
+        rig.machine.mode = Mode::Volume { slot: 2, value: 30 };
+        rig.machine.set_cards(changed(21.0, 55), &mut vec![]);
+        rig.wait(FOLLOW_AFTER);
+        assert_eq!(rig.machine.mode, Mode::Volume { slot: 2, value: 55 });
     }
 
     #[test]
