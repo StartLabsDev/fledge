@@ -2106,7 +2106,9 @@ impl Machine {
     /// card until Home Assistant catches up (apply_sent), so it doesn't
     /// jump back; the count (D3) takes the number to where it is.
     fn follow(&mut self) {
-        if self.pending.is_some() || self.turn != 0 || self.floor.is_some() {
+        // Counts the hand left short of a step don't hold it: past
+        // TURN_KEPT the next turn drops them anyway.
+        if self.pending.is_some() {
             return;
         }
         let next = match self.mode {
@@ -2149,6 +2151,8 @@ impl Machine {
             _ => return,
         };
         if next != self.mode {
+            self.turn = 0;
+            self.floor = None;
             self.mode = next;
             self.dirty = true;
         }
@@ -4076,6 +4080,27 @@ mod tests {
         rig.machine.set_nest(nest(serde_json::json!({"target": 22.0})));
         rig.wait(FOLLOW_AFTER * 2);
         assert_eq!(rig.machine.mode, Mode::Dial { of: Dial::Nest, target: 22.0 });
+    }
+
+    #[test]
+    fn an_open_dimmer_follows_home_assistant_after_a_turn_short_of_a_step() {
+        let mut rig = Rig::woken();
+        let lamp = |on: bool, brightness: u8| Cards::parse(format!(r#"{{"cards":[
+            {{"kind":"lights","name":"Bedroom","icon":"","lights":[
+                {{"id":"light.lamp","name":"Lamp","on":{on},"dimmable":true,"brightness":{brightness}}},
+                {{"id":"switch.fan","name":"Fan","on":false,"dimmable":false}}]}}],
+            "wake":"chooser"}}"#).as_bytes()).unwrap();
+        rig.machine.set_cards(lamp(true, 100), &mut vec![]);
+        rig.machine.mode = Mode::LightDim { slot: 0, light: 0, on: true, value: 100 };
+        // The hand turns a little, not a whole step, and lets go.
+        rig.turn(-3);
+        rig.wait(FOLLOW_AFTER);
+        rig.machine.set_cards(lamp(true, 40), &mut vec![]);
+        rig.wait(FOLLOW_AFTER);
+        assert_eq!(rig.machine.mode, Mode::LightDim { slot: 0, light: 0, on: true, value: 40 }, "set elsewhere: 40%");
+        rig.machine.set_cards(lamp(false, 40), &mut vec![]);
+        rig.wait(FOLLOW_AFTER);
+        assert!(matches!(rig.machine.mode, Mode::LightDim { on: false, .. }), "and off");
     }
 
     #[test]
