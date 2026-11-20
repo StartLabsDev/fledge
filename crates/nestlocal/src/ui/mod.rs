@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 pub use model::Command;
 use machine::{Action, Dial, Effect, Input, Machine, Mode, Slot};
-use model::{AlarmResult, Alert, Art, Card, Cards, ClimateChoice, Nest, OptionsCard};
+use model::{AlarmResult, Alert, Art, BrowserItem, BrowserMode, Card, Cards, ClimateChoice, Nest, OptionsCard};
 use std::borrow::Cow;
 use screens::Screen;
 
@@ -82,7 +82,10 @@ use crate::logf;
 ///      kelvin_whole say how far), and it says when it's at one; the
 ///      battery face (glance layout "battery", glance.battery)
 ///  15  the thermostat's own ring stops at limits too (thermostat_limits)
-pub const PROTOCOL: u32 = 15;
+///  16  browser cards (kind "browser": browse → launch lists for playlists,
+///      scenes, movies; launch / browse commands; Back + long-press pop;
+///      cover mode: fullscreen artwork, ring browses covers)
+pub const PROTOCOL: u32 = 16;
 
 /// The alerts the Nest has shown, as its log tells them (motion.rs):
 /// each hands it its own screen until it's done.
@@ -113,8 +116,14 @@ pub struct Ui {
     cards: Mutex<(u64, Cards)>,
     /// Each light's colour as last reported, for while it's off (Cards::keep_colours).
     colours: Mutex<HashMap<String, [u8; 3]>>,
-    /// Media players' album art, by entity id.
+    /// Media players' album art, by entity id (and cameras / battery / alerts).
     art: Mutex<HashMap<String, Arc<Art>>>,
+    /// Browser cover JPEGs/PNGs as received: many keys, still compressed.
+    /// Only `cover_rgb` is decoded — cover browse must not hold every tile's
+    /// RGB (48×480² was enough to stall the Nest).
+    cover_bytes: Mutex<HashMap<String, Arc<[u8]>>>,
+    /// The one cover browse tile currently on screen, decoded.
+    cover_rgb: Mutex<Option<(String, Arc<Art>)>>,
     /// Home Assistant's: keep the display lit (<base>/set/screen_on), and
     /// how many times it asked to wake it (<base>/set/screen_wake).
     keep_on: std::sync::atomic::AtomicBool,
@@ -126,6 +135,30 @@ pub struct Ui {
     /// A glance to try for a while (<base>/set/glance_try), counted; None
     /// puts the saved one back.
     glance_try: Mutex<(u64, Option<model::Glance>)>,
+}
+
+/// Browser art keys look like `fledge_browser.playlists:mix_1` (a colon that
+/// is not the battery/alert prefix). Media players use their entity id alone.
+fn is_browser_art(key: &str) -> bool {
+    key.contains(':') && !key.starts_with("alert:") && !key.starts_with("battery:")
+}
+
+/// Largest compressed cover kept (HA already shrinks; refuse a flood of huge
+/// retained payloads before they sit in `cover_bytes`).
+const COVER_BYTES_MAX: usize = 256 * 1024;
+
+/// Resolves browser rows: only the focused cover (if any) gets RGB; the rest
+/// stay icon-only until the ring lands on them (media-player style).
+fn fill_browser_art(items: &mut [BrowserItem], focused: Option<&(String, Arc<Art>)>) {
+    for item in items {
+        item.picture = match (&item.art, focused) {
+            (Some(key), Some((held, art))) if key == held => Some(art.clone()),
+            _ => None,
+        };
+        if !item.items.is_empty() {
+            fill_browser_art(&mut item.items, focused);
+        }
+    }
 }
 
 impl Ui {
@@ -147,9 +180,13 @@ impl Ui {
         self.cards.lock().unwrap().1.has_presence()
     }
 
-    /// Takes a media player's album art (<base>/set/art/<entity id>): a
-    /// PNG, or nothing for none.
+    /// Takes album / cover art (<base>/set/art/<key>): a JPEG or PNG, or
+    /// nothing for none. Browser covers stay compressed until focused;
+    /// media / camera / battery decode like before (one slot per key).
     pub fn set_art(&self, entity: &str, payload: &[u8]) -> Result<(), String> {
+        if is_browser_art(entity) {
+            return self.set_cover_bytes(entity, payload);
+        }
         let art = if payload.is_empty() { None } else { Some(Arc::new(Art::decode(payload)?)) };
         let mut held = self.art.lock().unwrap();
         if entity.starts_with("alert:") {
@@ -166,6 +203,66 @@ impl Ui {
             self.cards.lock().unwrap().0 += 1;
         }
         Ok(())
+    }
+
+    fn set_cover_bytes(&self, key: &str, payload: &[u8]) -> Result<(), String> {
+        let mut bytes = self.cover_bytes.lock().unwrap();
+        let changed = if payload.is_empty() {
+            bytes.remove(key).is_some()
+        } else {
+            if payload.len() > COVER_BYTES_MAX {
+                return Err(format!("art: {} bytes: at most {COVER_BYTES_MAX}", payload.len()));
+            }
+            if !(payload.starts_with(&[0xFF, 0xD8]) || payload.starts_with(b"\x89PNG")) {
+                return Err("art: not a JPEG or PNG".into());
+            }
+            let next: Arc<[u8]> = Arc::from(payload.to_vec());
+            match bytes.insert(key.to_owned(), next.clone()) {
+                Some(old) => old.as_ref() != next.as_ref(),
+                None => true,
+            }
+        };
+        drop(bytes);
+        if changed {
+            let mut rgb = self.cover_rgb.lock().unwrap();
+            if rgb.as_ref().is_some_and(|(held, _)| held == key) {
+                *rgb = None; // re-decode on next focus
+            }
+            drop(rgb);
+            self.cards.lock().unwrap().0 += 1;
+        }
+        Ok(())
+    }
+
+    /// Decode at most one browser cover into RGB (drop the previous). `None`
+    /// clears it — leave cover browse or land on Back / a row with no art.
+    /// Returns true when the focused RGB tile changed (caller redraws).
+    pub fn focus_cover(&self, key: Option<&str>) -> bool {
+        let mut held = self.cover_rgb.lock().unwrap();
+        let same = match (held.as_ref(), key) {
+            (Some((have, _)), Some(want)) if have == want => true,
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return false;
+        }
+        let next = key.and_then(|want| {
+            let bytes = self.cover_bytes.lock().unwrap();
+            let data = bytes.get(want)?.clone();
+            drop(bytes);
+            match Art::decode_cover(&data) {
+                Ok(art) => Some((want.to_owned(), Arc::new(art))),
+                Err(e) => {
+                    logf!("ui: cover {want}: {e}");
+                    None
+                }
+            }
+        });
+        *held = next;
+        drop(held);
+        self.cards.lock().unwrap().0 += 1;
+        true
     }
 
     /// Keeps the display lit (true) or leaves it to go out as it does.
@@ -187,6 +284,7 @@ impl Ui {
     fn snapshot(&self) -> (u64, Cards) {
         let (generation, mut cards) = self.cards.lock().unwrap().clone();
         let art = self.art.lock().unwrap();
+        let cover = self.cover_rgb.lock().unwrap();
         let pictured = |glance: &mut model::Glance| {
             if let Some(battery) = &mut glance.battery {
                 battery.art = model::Pic(battery.picture.as_deref().and_then(|key| art.get(key).cloned()));
@@ -200,6 +298,7 @@ impl Ui {
                 Card::Face(face) => pictured(&mut face.glance),
                 Card::Media(media) => media.art = art.get(&media.id).cloned(),
                 Card::Camera(camera) => camera.art = art.get(&camera.id).cloned(),
+                Card::Browser(browser) => fill_browser_art(&mut browser.items, cover.as_ref()),
                 _ => {}
             }
         }
@@ -545,6 +644,7 @@ fn card_name(card: &Card) -> &str {
         Card::Action(card) => &card.name,
         Card::Camera(card) => &card.name,
         Card::Options(card) => &card.name,
+        Card::Browser(card) => &card.name,
         Card::Cover(card) => &card.name,
         Card::Alarm(card) => &card.name,
         Card::Face(card) => &card.name,
@@ -909,6 +1009,8 @@ impl Runtime {
                 || matches!(self.machine.mode, Mode::Chooser(_) | Mode::Settings { .. }) && before != self.machine.mode {
                 mode_state(&self.machine.mode);
             }
+            // Cover browse: one decoded RGB at a time (media-player style).
+            self.sync_cover_focus(&mut effects);
             self.schedule_pulse(&before, now);
             self.fade_now_label(&before);
             let set_words = self.machine.set_at.is_some_and(|at| now.duration_since(at) < machine::SET_SHOWN);
@@ -1591,6 +1693,7 @@ impl Runtime {
                 Some(Card::Action(card)) => card.name.clone(),
                 Some(Card::Camera(card)) => card.name.clone(),
                 Some(Card::Options(card)) => card.name.clone(),
+                Some(Card::Browser(card)) => card.name.clone(),
                 Some(Card::Cover(card)) => card.name.clone(),
                 Some(Card::Alarm(card)) => card.name.clone(),
                 Some(Card::Face(card)) => card.name.clone(),
@@ -1619,6 +1722,29 @@ impl Runtime {
             _ => None,
         };
         Some(Drawn { card: Some(card.clone()), done: self.machine.ran.is_some_and(|(ran, _)| ran == slot), progress })
+    }
+
+    /// Keep at most one browser cover decoded: the ring's current tile (or
+    /// none on Back / list mode / left the browser).
+    fn sync_cover_focus(&mut self, effects: &mut Vec<Effect>) {
+        let key = match &self.machine.mode {
+            Mode::BrowserList { slot, path, selected } => {
+                match self.machine.cards.cards.get(*slot) {
+                    Some(Card::Browser(card)) if card.mode == BrowserMode::Cover => {
+                        card.at(path).get(*selected).and_then(|item| item.art.clone())
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if !self.ui.focus_cover(key.as_deref()) {
+            return;
+        }
+        let (generation, cards) = self.ui.snapshot();
+        self.generation = generation;
+        self.machine.set_cards(cards, effects);
+        self.revalidate();
     }
 
     /// Checks each card's frame against what it would be drawn from now: a
@@ -1721,6 +1847,7 @@ impl Runtime {
             Some(Card::Action(card)) => Screen::ActionCard { card, done: source.done, opened: false },
             Some(Card::Camera(card)) => Screen::CameraCard { card },
             Some(Card::Options(card)) => Screen::OptionsCard { card },
+            Some(Card::Browser(card)) => Screen::BrowserCard { card },
             Some(Card::Cover(card)) => Screen::CoverCard { card },
             Some(Card::Alarm(card)) => Screen::AlarmCard { card },
             Some(Card::Face(card)) => Screen::Glance { at: self.face_at(card) },
@@ -2086,6 +2213,12 @@ impl Runtime {
             },
             Mode::OptionList { slot, selected } => match card(*slot)? {
                 Card::Options(card) => Screen::OptionList { card: Cow::Borrowed(card), selected: *selected },
+                _ => return None,
+            },
+            Mode::BrowserList { slot, path, selected } => match card(*slot)? {
+                Card::Browser(card) => Screen::BrowserList {
+                    card: Cow::Borrowed(card), path: path.clone(), selected: *selected,
+                },
                 _ => return None,
             },
             Mode::DialList { of, list, selected } => match machine.climate(*of) {
@@ -2592,7 +2725,7 @@ type Transition = motion::Kind;
 fn depth(mode: &Mode, machine: &Machine) -> u8 {
     match mode {
         Mode::LightList { .. } | Mode::Dial { .. } | Mode::Volume { .. } | Mode::Camera { .. }
-        | Mode::OptionList { .. } | Mode::CoverSet { .. } | Mode::Settings { .. }
+        | Mode::OptionList { .. } | Mode::BrowserList { .. } | Mode::CoverSet { .. } | Mode::Settings { .. }
         | Mode::AlarmView { .. } | Mode::ActionView { .. } | Mode::FaceView { .. } => 1,
         // A lamp's own card opens straight to its dimmer; a room's, from its list.
         Mode::LightDim { slot, .. } => match machine.cards.cards.get(*slot) {
@@ -2822,6 +2955,7 @@ mod tests {
         // small square in the middle of the display.
         let art = Art::decode(include_bytes!("testdata/still.jpg")).unwrap();
         assert_eq!(art.size, model::ART_MAX, "square, the display's size");
+        assert_eq!(art.height, model::ART_MAX);
         let side = art.size as usize;
         let at = |x: usize, y: usize| &art.rgb[(y * side + x) * 3..(y * side + x) * 3 + 3];
         assert!(at(40, 240)[0] > 150 && at(40, 240)[2] < 90, "red at the left: {:?}", at(40, 240));
@@ -2867,7 +3001,7 @@ mod tests {
         let (after, cards) = ui.snapshot();
         assert!(after > before, "new art redraws");
         let Card::Media(card) = &cards.cards[0] else { panic!() };
-        assert_eq!(card.art.as_deref(), Some(&Art { size: 4, rgb: [10, 20, 30].repeat(16), alpha: None }), "alpha dropped");
+        assert_eq!(card.art.as_deref(), Some(&Art { size: 4, height: 4, rgb: [10, 20, 30].repeat(16), alpha: None }), "alpha dropped");
         ui.set_art("media_player.speaker", &png(4, png::ColorType::Rgba, &[10, 20, 30, 255])).unwrap();
         assert_eq!(ui.snapshot().0, after, "the same art: nothing to redraw");
         assert!(ui.set_art("media_player.speaker", &png(600, png::ColorType::Rgb, &[0, 0, 0])).is_err(), "too big");
@@ -2875,6 +3009,27 @@ mod tests {
         ui.set_art("media_player.speaker", b"").unwrap();
         let (_, cards) = ui.snapshot();
         assert!(matches!(&cards.cards[0], Card::Media(card) if card.art.is_none()), "empty: none");
+    }
+
+    #[test]
+    fn browser_covers_decode_only_the_focused_tile() {
+        let ui = Ui::default();
+        let picture = png(4, png::ColorType::Rgb, &[1, 2, 3]);
+        let a = "fledge_browser.playlists:mix_1";
+        let b = "fledge_browser.playlists:mix_2";
+        ui.set_art(a, &picture).unwrap();
+        ui.set_art(b, &picture).unwrap();
+        assert!(ui.art.lock().unwrap().is_empty(), "covers stay out of the media art map");
+        assert_eq!(ui.cover_bytes.lock().unwrap().len(), 2);
+        assert!(ui.cover_rgb.lock().unwrap().is_none());
+        assert!(ui.focus_cover(Some(a)));
+        assert!(!ui.focus_cover(Some(a)), "same tile: no redraw");
+        assert_eq!(ui.cover_rgb.lock().unwrap().as_ref().map(|(k, _)| k.as_str()), Some(a));
+        assert!(ui.focus_cover(Some(b)));
+        assert_eq!(ui.cover_rgb.lock().unwrap().as_ref().map(|(k, _)| k.as_str()), Some(b));
+        assert!(ui.focus_cover(None));
+        assert!(ui.cover_rgb.lock().unwrap().is_none(), "left cover browse: RGB gone");
+        assert_eq!(ui.cover_bytes.lock().unwrap().len(), 2, "compressed bytes kept for later");
     }
 
     #[test]
@@ -2886,7 +3041,7 @@ mod tests {
         ui.set_art("battery:glance", &png(4, png::ColorType::Rgba, &[10, 20, 30, 128])).unwrap();
         let (_, cards) = ui.snapshot();
         let own = cards.glance.as_ref().and_then(|g| g.battery.as_ref()).unwrap();
-        assert_eq!(own.art.0.as_deref(), Some(&Art { size: 4, rgb: [10, 20, 30].repeat(16), alpha: Some(vec![128; 16]) }));
+        assert_eq!(own.art.0.as_deref(), Some(&Art { size: 4, height: 4, rgb: [10, 20, 30].repeat(16), alpha: Some(vec![128; 16]) }));
         let Card::Face(face) = &cards.cards[0] else { panic!() };
         assert!(face.glance.battery.as_ref().unwrap().art.0.is_none(), "its own key, not the glance's");
     }
@@ -3506,7 +3661,7 @@ mod shots {
         save(&screens::draw(&fonts, &Screen::ActionCard { card: &scene, done: false, opened: true }, None), &format!("{out}/a1-scene-opened.png"));
         save(&screens::draw(&fonts, &Screen::ActionCard { card: &scene, done: true, opened: true }, None), &format!("{out}/a2-scene-done.png"));
         let size = 480;
-        let still = Arc::new(Art { size, rgb: (0..size * size).flat_map(|i| {
+        let still = Arc::new(Art { size, height: size, rgb: (0..size * size).flat_map(|i| {
             let (x, y) = (i % size, i / size);
             [(60 + x / 6) as u8, (70 + y / 5) as u8, (90 + (x + y) / 12) as u8]
         }).collect(), alpha: None });
@@ -3611,7 +3766,7 @@ mod shots {
         // The size the integration sends album art at.
         let size = 168;
         let rgb = (0..size * size).flat_map(|i| [(i % size * 255 / size) as u8, (i / size * 255 / size) as u8, 160]);
-        with_art.art = Some(Arc::new(Art { size, rgb: rgb.collect(), alpha: None }));
+        with_art.art = Some(Arc::new(Art { size, height: size, rgb: rgb.collect(), alpha: None }));
         save(&screens::draw(&fonts, &Screen::MediaCard { card: &with_art, volume: None, progress: Some(0.4) }, None), &format!("{out}/3b-art.png"));
         let state = |extra: serde_json::Value| {
             let mut s = serde_json::json!({"mode": "heat", "action": "idle", "target": 20.5, "current_temperature": 19.5,
@@ -3669,6 +3824,7 @@ mod shots {
         let pixels: Vec<(u32, u32)> = (0..side * side).map(|i| (i % side, i / side)).collect();
         pictured.battery.as_mut().unwrap().art = model::Pic(Some(Arc::new(Art {
             size: side,
+            height: side,
             rgb: pixels.iter().flat_map(|(x, y)| [(150 + x / 2) as u8, (170 + y / 4) as u8, 210]).collect(),
             alpha: Some(pixels.iter().map(|(x, y)| if solid(*x, *y) { 255 } else { 0 }).collect()),
         })));

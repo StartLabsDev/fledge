@@ -4,8 +4,8 @@
 
 use super::icons;
 use super::machine::Setting;
-use super::model::{self, ActionCard, AlarmCard, AlarmMode, Alert, CameraCard, Card, ClimateCard, ClimateChoice, CoverCard, Glance,
-                   Layout, Light, LightsCard, Line, MediaCard, Nest, OptionsCard, Weather};
+use super::model::{self, ActionCard, AlarmCard, AlarmMode, Alert, BrowserCard, BrowserItem, BrowserMode, BrowserProvider, CameraCard, Card, ClimateCard,
+                   ClimateChoice, CoverCard, Glance, Layout, Light, LightsCard, Line, MediaCard, Nest, OptionsCard, Weather};
 use super::paint::{self, *};
 
 use std::borrow::Cow;
@@ -27,6 +27,9 @@ pub enum Screen<'a> {
     OptionsCard { card: &'a OptionsCard },
     /// (A climate's modes and fan speeds are listed as one, made for it.)
     OptionList { card: Cow<'a, OptionsCard>, selected: usize },
+    /// A browser card among the chooser, and its items listed (Back last).
+    BrowserCard { card: &'a BrowserCard },
+    BrowserList { card: Cow<'a, BrowserCard>, path: Vec<String>, selected: usize },
     /// A light group's own lights, listed to switch.
     Members { card: &'a LightsCard, selected: usize },
     /// A cover's card, and its position on the ring.
@@ -139,6 +142,11 @@ pub fn draw(fonts: &Fonts, screen: &Screen, sweep: Option<f32>) -> Canvas {
         Screen::Alert { alert } => alert_screen(fonts, alert),
         Screen::OptionsCard { card } => options_card(fonts, card),
         Screen::OptionList { card, selected } => option_list(fonts, card, *selected, Layer::Whole),
+        Screen::BrowserCard { card } => browser_card(fonts, card),
+        Screen::BrowserList { card, path, selected } => match card.mode {
+            BrowserMode::Cover => browser_cover(fonts, card, path, *selected),
+            BrowserMode::List => browser_list(fonts, card, path, *selected, Layer::Whole),
+        },
         Screen::Members { card, selected } => lights_listed(fonts, &card.name, &card.members, *selected, Layer::Whole),
         Screen::CoverCard { card } => cover_card(fonts, card),
         Screen::AlarmCard { card } => alarm_screen(fonts, card, None, None),
@@ -453,7 +461,8 @@ fn ring_on(p: &mut Canvas, live: Option<&mut paint::Live>, of: impl Fn(usize) ->
 
 fn icon(pixmap: &mut Canvas, name: &str, entity: &str, cx: f32, cy: f32, size: f32, c: [u8; 3]) {
     if let Some(found) = icons::lookup(name, entity) {
-        paint::icon(pixmap, found, cx, cy, size, colour(c));
+        let tint = icons::brand_colour(name).unwrap_or(c);
+        paint::icon(pixmap, found, cx, cy, size, colour(tint));
     }
 }
 
@@ -1260,6 +1269,9 @@ pub fn list_place(screen: &Screen) -> Option<(usize, usize)> {
         Screen::LightList { card, selected } => (*selected, card.lights.len() + 1),
         Screen::Members { card, selected } => (*selected, card.members.len() + 1),
         Screen::OptionList { card, selected } => (*selected, card.options.len() + 1),
+        Screen::BrowserList { card, path, selected } if card.mode == BrowserMode::List => {
+            (*selected, card.at(path).len() + 1)
+        }
         Screen::Settings { rows, selected, .. } => (*selected, rows.len()),
         Screen::ModePrompt { selected, .. } => (*selected, PROMPT_ROWS),
         _ => return None,
@@ -1274,6 +1286,9 @@ pub fn list_layer(fonts: &Fonts, screen: &Screen, layer: Layer) -> Option<Canvas
         Screen::LightList { card, selected } => lights_listed(fonts, &card.name, &card.lights, *selected, layer),
         Screen::Members { card, selected } => lights_listed(fonts, &card.name, &card.members, *selected, layer),
         Screen::OptionList { card, selected } => option_list(fonts, card, *selected, layer),
+        Screen::BrowserList { card, path, selected } if card.mode == BrowserMode::List => {
+            browser_list(fonts, card, path, *selected, layer)
+        }
         Screen::Settings { rows, nest, nest_dial, selected } => settings_list(fonts, rows, *nest, *nest_dial, *selected, layer),
         Screen::ModePrompt { nest, selected } => mode_prompt(fonts, nest, *selected, layer),
         _ => return None,
@@ -1288,6 +1303,7 @@ pub fn list_neighbours<'a>(screen: &Screen<'a>) -> Vec<Screen<'a>> {
         Screen::LightList { card, .. } => card.lights.len() + 1,
         Screen::Members { card, .. } => card.members.len() + 1,
         Screen::OptionList { card, .. } => card.options.len() + 1,
+        Screen::BrowserList { card, path, .. } if card.mode == BrowserMode::List => card.at(path).len() + 1,
         Screen::Settings { rows, .. } => rows.len(),
         _ => return Vec::new(),
     };
@@ -1302,6 +1318,9 @@ fn list_with<'a>(screen: &Screen<'a>, selected: usize) -> Option<Screen<'a>> {
         Screen::LightList { card, .. } => Screen::LightList { card, selected },
         Screen::Members { card, .. } => Screen::Members { card, selected },
         Screen::OptionList { card, .. } => Screen::OptionList { card: card.clone(), selected },
+        Screen::BrowserList { card, path, .. } if card.mode == BrowserMode::List => {
+            Screen::BrowserList { card: card.clone(), path: path.clone(), selected }
+        }
         Screen::Settings { rows, nest, nest_dial, .. } => Screen::Settings { rows: rows.clone(), nest: *nest, nest_dial: *nest_dial, selected },
         _ => return None,
     })
@@ -1313,6 +1332,9 @@ pub fn list_key(screen: &Screen) -> Option<String> {
         Screen::LightList { card, .. } => format!("lights {first} {card:?}"),
         Screen::Members { card, .. } => format!("members {first} {card:?}"),
         Screen::OptionList { card, .. } => format!("options {first} {card:?}"),
+        Screen::BrowserList { card, path, .. } if card.mode == BrowserMode::List => {
+            format!("browser {first} {path:?} {card:?}")
+        }
         Screen::Settings { rows, nest, nest_dial, .. } => format!("settings {first} {rows:?} {nest:?} {nest_dial}"),
         Screen::ModePrompt { nest, .. } => format!("prompt {first} {}", nest.on_mode()),
         _ => return None,
@@ -2231,6 +2253,173 @@ fn option_list(fonts: &Fonts, card: &OptionsCard, selected: usize, layer: Layer)
         if now {
             paint::text_at(&mut p, fonts.regular(), 24.0, x + w - 22.0 - value_width, y + 36.0, value, 0.0,
                            if chosen { WHITE } else { ACTION }, 1.0);
+        }
+    }
+    p
+}
+
+fn browser_card(fonts: &Fonts, card: &BrowserCard) -> Canvas {
+    let mut p = paint::face(BLACK);
+    let found = icons::lookup(&card.icon, &card.id).or_else(|| icons::lookup("mdi:playlist-play", ""));
+    if let Some(found) = found {
+        paint::icon(&mut p, found, HALF, 150.0, 84.0, colour(WHITE));
+    }
+    label(&mut p, fonts, 232.0, &card.name, GREY);
+    let hint = if card.items.is_empty() {
+        "—"
+    } else if card.mode == BrowserMode::Cover {
+        "Press for covers"
+    } else {
+        "Press to browse"
+    };
+    let hint = paint::fit(fonts.regular(), 40.0, hint, 0.0, 330.0);
+    paint::text(&mut p, fonts.regular(), 40.0, HALF, 292.0, &hint, 0.0, WHITE);
+    p
+}
+
+fn browser_list(fonts: &Fonts, card: &BrowserCard, path: &[String], selected: usize, layer: Layer) -> Canvas {
+    let items: &[BrowserItem] = card.at(path);
+    let rows = items.len() + 1;
+    let first = first_row(selected, rows);
+    let mut p = list_backdrop(layer, selected.checked_sub(first));
+    let title = if path.is_empty() {
+        card.name.as_str()
+    } else {
+        path.last().and_then(|id| {
+            let parent = card.at(&path[..path.len().saturating_sub(1)]);
+            parent.iter().find(|i| i.id == *id).map(|i| i.name.as_str())
+        }).unwrap_or(card.name.as_str())
+    };
+    label(&mut p, fonts, LIST_TITLE, title, GREY);
+    for (slot, row) in (first..rows.min(first + ROWS)).enumerate() {
+        let y = LIST_TOP + slot as f32 * ROW_PITCH;
+        let (x, w, h) = PILL;
+        let chosen = layer.chosen(row == selected);
+        match items.get(row) {
+            Some(item) => {
+                let icon_name = if item.folder {
+                    if item.icon.is_empty() { "mdi:folder" } else { item.icon.as_str() }
+                } else if item.icon.is_empty() {
+                    "mdi:play"
+                } else {
+                    item.icon.as_str()
+                };
+                icon(&mut p, icon_name, &item.id, x + 34.0, y + h / 2.0, 28.0, if chosen { WHITE } else { GREY });
+                let name = paint::fit(fonts.regular(), 26.0, &item.name, 0.0, w - 90.0);
+                paint::text_at(&mut p, fonts.regular(), 26.0, x + 62.0, y + 37.0, &name, 0.0, WHITE, 1.0);
+            }
+            None => {
+                icon(&mut p, "mdi:arrow-left", "back", x + 34.0, y + h / 2.0, 28.0, if chosen { WHITE } else { GREY });
+                paint::text_at(&mut p, fonts.regular(), 26.0, x + 62.0, y + 37.0, "Back", 0.0, WHITE, 1.0);
+            }
+        }
+    }
+    p
+}
+
+
+/// Stable RGB for a scene with no icon yet (matches HA colour:name: fallback).
+fn scene_colour(id: &str) -> [u8; 3] {
+    let mut seed: u32 = 0;
+    for b in id.bytes() {
+        seed = seed.wrapping_mul(33).wrapping_add(b as u32);
+    }
+    [
+        (90 + (seed & 0x7F)) as u8,
+        (70 + ((seed >> 8) & 0x7F)) as u8,
+        (50 + ((seed >> 16) & 0x7F)) as u8,
+    ]
+}
+
+/// Cover browse ring: fill ticks from the start up to `selected` of
+/// `slots` (items + Back), so turning through a folder reads as progress.
+fn browser_cover_ring(p: &mut Canvas, selected: usize, slots: usize) {
+    let last = (slots.max(1) - 1).max(1);
+    let top = paint::tick_at(selected.min(last) as f32 / last as f32);
+    paint::ring(p, |i| {
+        if i <= top { colour(MEDIA) } else { colour(DIM) }
+    }, &[top]);
+}
+
+/// Cover mode: one item's artwork centred; the ring flips covers. Music uses
+/// a square album cover (not fullscreen — that pixelates and crops). Movies
+/// will use a poster, Hue scenes a round tile. Last slot is Back. Brand marks
+/// stay off the art — Daily Mix / playlist covers already include them.
+fn browser_cover(fonts: &Fonts, card: &BrowserCard, path: &[String], selected: usize) -> Canvas {
+    let items = card.at(path);
+    let slots = items.len() + 1; // …covers, then Back
+    let mut p = paint::face(BLACK);
+    browser_cover_ring(&mut p, selected, slots);
+    if selected >= items.len() {
+        icon(&mut p, "mdi:arrow-left", "back", HALF, 178.0, 96.0, WHITE);
+        let name = paint::fit(fonts.regular(), 40.0, "Back", 0.0, 330.0);
+        paint::text(&mut p, fonts.regular(), 40.0, HALF, 286.0, &name, 0.0, WHITE);
+        let under = if path.is_empty() { "Leave" } else { "Up one folder" };
+        line(&mut p, fonts, 328.0, under, GREY);
+        return p;
+    }
+    let item = &items[selected];
+    match &item.picture {
+        Some(art) => {
+            // Music: square cover. Scenes: round disc. Movies: 2:3 poster.
+            // ~220 keeps corners inside the tick arc; cy a little low so the top
+            // of the art doesn't sit on the ring.
+            let cy = 222.0_f32;
+            let name_y = match card.provider {
+                BrowserProvider::Movies => {
+                    let (aw, ah) = (art.size as f32, art.height.max(1) as f32);
+                    let (max_w, max_h) = (168.0_f32, 252.0_f32);
+                    let scale = (max_w / aw).min(max_h / ah).min(1.0);
+                    let (dw, dh) = ((aw * scale).round().max(1.0), (ah * scale).round().max(1.0));
+                    paint::picture_scaled_wh(
+                        &mut p, &art.rgb, art.size, art.height.max(1),
+                        dw as u32, dh as u32, HALF, cy, 10.0,
+                    );
+                    cy + dh / 2.0 + 34.0
+                }
+                BrowserProvider::Scenes => {
+                    let side = 210.0_f32.min(art.size as f32);
+                    paint::picture_scaled(&mut p, &art.rgb, art.size, side as u32, HALF, cy, side / 2.0);
+                    cy + side / 2.0 + 34.0
+                }
+                BrowserProvider::Playlist => {
+                    let side = 220.0_f32.min(art.size as f32);
+                    paint::picture_scaled(&mut p, &art.rgb, art.size, side as u32, HALF, cy, 16.0);
+                    cy + side / 2.0 + 34.0
+                }
+            };
+            let name = paint::fit(fonts.medium(), 28.0, &item.name, 0.0, 300.0);
+            paint::text(&mut p, fonts.medium(), 28.0, HALF, name_y, &name, 0.0, WHITE);
+        }
+        None => {
+            // Hue scenes: round colour tile when the icon hasn't arrived (or 404).
+            if matches!(card.provider, BrowserProvider::Scenes) && !item.folder {
+                let c = scene_colour(&item.id);
+                paint::circle(&mut p, HALF, 222.0, 105.0, colour(c));
+                let name = paint::fit(fonts.medium(), 28.0, &item.name, 0.0, 300.0);
+                paint::text(&mut p, fonts.medium(), 28.0, HALF, 222.0 + 105.0 + 34.0, &name, 0.0, WHITE);
+            } else {
+                let icon_name = if item.folder {
+                    if item.icon.is_empty() {
+                        match card.provider {
+                            BrowserProvider::Scenes => "mdi:lightbulb-group",
+                            BrowserProvider::Movies => "mdi:folder",
+                            BrowserProvider::Playlist => "mdi:folder-music",
+                        }
+                    } else { item.icon.as_str() }
+                } else if item.icon.is_empty() {
+                    match card.provider {
+                        BrowserProvider::Scenes => "mdi:palette",
+                        BrowserProvider::Movies => "mdi:movie-open",
+                        BrowserProvider::Playlist => "mdi:playlist-music",
+                    }
+                } else {
+                    item.icon.as_str()
+                };
+                icon(&mut p, icon_name, &item.id, HALF, 190.0, 88.0, WHITE);
+                let name = paint::fit(fonts.regular(), 36.0, &item.name, 0.0, 330.0);
+                paint::text(&mut p, fonts.regular(), 36.0, HALF, 292.0, &name, 0.0, WHITE);
+            }
         }
     }
     p

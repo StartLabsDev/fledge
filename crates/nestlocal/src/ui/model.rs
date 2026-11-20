@@ -476,6 +476,9 @@ pub enum Card {
     /// A glance face (protocol 13): something to look at, drawn as the
     /// glance is, with actions round its ring.
     Face(FaceCard),
+    /// A browse → launch list (protocol 16): playlists, scenes, movies —
+    /// each its own card; folders nest, leaves launch.
+    Browser(BrowserCard),
     /// A kind from a newer Fledge: left out rather than failing the rest.
     #[serde(other)]
     Unknown,
@@ -553,6 +556,80 @@ pub struct OptionsCard {
     pub options: Vec<String>,
     #[serde(default)]
     pub current: Option<String>,
+}
+
+/// How a browser card opens: a scrolling list, or cover art the ring flips
+/// through (square for music, poster for movies, round for Hue scenes).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserMode {
+    #[default]
+    List,
+    Cover,
+}
+
+/// What a browser launches — shapes cover art on the Nest.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserProvider {
+    #[default]
+    Playlist,
+    Scenes,
+    Movies,
+}
+
+/// One row in a browser: a leaf to launch, or a folder of more items.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct BrowserItem {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub icon: String,
+    /// Album / cover art id for `<base>/set/art/<art>` (optional).
+    #[serde(default)]
+    pub art: Option<String>,
+    /// The picture once it's come (from `art`); not in the cards JSON.
+    #[serde(skip)]
+    pub picture: Option<Arc<Art>>,
+    #[serde(default)]
+    pub folder: bool,
+    /// Static children when `folder` (v1); empty folders may use `browse` later.
+    #[serde(default)]
+    pub items: Vec<BrowserItem>,
+}
+
+/// A separate chooser card that browses items and launches one (playlists,
+/// Hue scenes, movies — same Nest UI, different HA provider per card).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct BrowserCard {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub icon: String,
+    /// playlist → square cover; movies → poster; scenes → round tile.
+    #[serde(default)]
+    pub provider: BrowserProvider,
+    /// List (default) or cover: artwork the ring browses.
+    #[serde(default)]
+    pub mode: BrowserMode,
+    #[serde(default)]
+    pub items: Vec<BrowserItem>,
+}
+
+impl BrowserCard {
+    /// Items at `path` (folder ids from the root), or the root when empty.
+    pub fn at<'a>(&'a self, path: &[String]) -> &'a [BrowserItem] {
+        let mut items = self.items.as_slice();
+        for id in path {
+            let Some(folder) = items.iter().find(|i| i.folder && i.id == *id) else {
+                return &[];
+            };
+            items = folder.items.as_slice();
+        }
+        items
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -1340,10 +1417,13 @@ impl MediaCard {
     }
 }
 
-/// Album art: a square picture, RGB, at most ART_MAX wide.
+/// Album / cover art: RGB, at most ART_MAX on each side. Square for music
+/// and cameras (`height == size`); movie posters keep their 2:3 ratio.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Art {
+    /// Width in pixels (historical name: square side).
     pub size: u32,
+    pub height: u32,
     pub rgb: Vec<u8>,
     /// How solid each pixel is, where the picture is see-through anywhere
     /// (a battery face's picture, a car cut out of its background).
@@ -1373,16 +1453,25 @@ impl Art {
     /// From a JPEG (a camera's picture) or a PNG (album art).
     pub fn decode(data: &[u8]) -> Result<Art, String> {
         if data.starts_with(&[0xFF, 0xD8]) {
-            Art::decode_jpeg(data)
+            Art::decode_jpeg(data, true)
         } else {
-            Art::decode_png(data)
+            Art::decode_png(data, true)
         }
     }
 
-    /// A JPEG, cropped square from its middle and scaled to fill the
-    /// display: down if it's larger, up (smoothly) if it's smaller, so a
-    /// small still never shows as a small square in the middle.
-    fn decode_jpeg(data: &[u8]) -> Result<Art, String> {
+    /// A browser cover: JPEG/PNG kept near its native size (never upscaled
+    /// to the display). Cover browse only decodes one of these at a time.
+    pub fn decode_cover(data: &[u8]) -> Result<Art, String> {
+        if data.starts_with(&[0xFF, 0xD8]) {
+            Art::decode_jpeg(data, false)
+        } else {
+            Art::decode_png(data, false)
+        }
+    }
+
+    /// A JPEG. `fill` (camera / media) crops square from the middle and
+    /// scales up to ART_MAX; covers keep aspect and never upscale.
+    fn decode_jpeg(data: &[u8], fill: bool) -> Result<Art, String> {
         use zune_core::colorspace::ColorSpace;
         use zune_core::options::DecoderOptions;
         let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
@@ -1399,10 +1488,13 @@ impl Art {
         if pixels.len() < width * height * 3 {
             return Err("art: short".into());
         }
-        let side = width.min(height);
-        if side == 0 {
+        if width == 0 || height == 0 {
             return Err("art: empty".into());
         }
+        if !fill {
+            return Self::fit_cover_rgb(&pixels, width, height);
+        }
+        let side = width.min(height);
         let (left, top) = ((width - side) / 2, (height - side) / 2);
         let size = ART_MAX as usize;
         let mut rgb = Vec::with_capacity(size * size * 3);
@@ -1436,11 +1528,40 @@ impl Art {
                 }
             }
         }
-        Ok(Art { size: size as u32, rgb, alpha: None })
+        Ok(Art { size: size as u32, height: size as u32, rgb, alpha: None })
     }
 
-    /// A PNG, square and 8-bit RGB or RGBA.
-    fn decode_png(png_data: &[u8]) -> Result<Art, String> {
+    /// Fit a cover inside ART_MAX×ART_MAX, keep aspect, never upscale.
+    fn fit_cover_rgb(pixels: &[u8], width: usize, height: usize) -> Result<Art, String> {
+        let max = ART_MAX as usize;
+        let (out_w, out_h) = if width <= max && height <= max {
+            (width, height)
+        } else {
+            let scale = (max as f32 / width as f32).min(max as f32 / height as f32);
+            (
+                ((width as f32 * scale).round() as usize).max(1),
+                ((height as f32 * scale).round() as usize).max(1),
+            )
+        };
+        let mut rgb = Vec::with_capacity(out_w * out_h * 3);
+        if out_w == width && out_h == height {
+            rgb.extend_from_slice(&pixels[..width * height * 3]);
+        } else {
+            for y in 0..out_h {
+                let sy = y * height / out_h;
+                for x in 0..out_w {
+                    let sx = x * width / out_w;
+                    let at = (sy * width + sx) * 3;
+                    rgb.extend_from_slice(&pixels[at..at + 3]);
+                }
+            }
+        }
+        Ok(Art { size: out_w as u32, height: out_h as u32, rgb, alpha: None })
+    }
+
+    /// A PNG, 8-bit RGB or RGBA. Camera / battery faces stay square; covers
+    /// (`square = false`) may be rectangular within ART_MAX.
+    fn decode_png(png_data: &[u8], square: bool) -> Result<Art, String> {
         let mut reader = png::Decoder::new(png_data).read_info().map_err(|e| format!("art: {e}"))?;
         // Its size checked before anything is allocated for it: a huge one
         // from anyone on the broker mustn't take the thermostat's memory.
@@ -1450,10 +1571,13 @@ impl Art {
         }
         let mut buffer = vec![0; reader.output_buffer_size()];
         let info = reader.next_frame(&mut buffer).map_err(|e| format!("art: {e}"))?;
-        if info.width != info.height || info.width == 0 || info.width > ART_MAX
-            || info.bit_depth != png::BitDepth::Eight {
-            return Err(format!("art: {}x{} at {:?} bits: wants square 8-bit, at most {ART_MAX}",
-                               info.width, info.height, info.bit_depth));
+        if info.width == 0 || info.height == 0 || info.width > ART_MAX || info.height > ART_MAX
+            || info.bit_depth != png::BitDepth::Eight
+            || (square && info.width != info.height)
+        {
+            return Err(format!("art: {}x{} at {:?} bits: wants {} 8-bit, at most {ART_MAX}",
+                               info.width, info.height, info.bit_depth,
+                               if square { "square" } else { "rectangular" }));
         }
         let pixels = &buffer[..info.buffer_size()];
         let rgb = match info.color_type {
@@ -1464,7 +1588,7 @@ impl Art {
         // Its alpha kept only where it's see-through somewhere.
         let alpha = (info.color_type == png::ColorType::Rgba && pixels.as_chunks::<4>().0.iter().any(|p| p[3] != 255))
             .then(|| pixels.as_chunks::<4>().0.iter().map(|p| p[3]).collect());
-        Ok(Art { size: info.width, rgb, alpha })
+        Ok(Art { size: info.width, height: info.height, rgb, alpha })
     }
 }
 
@@ -1578,6 +1702,10 @@ pub enum Command {
     Climate(String, ClimateChoice, String),
     /// A select's option.
     Select(String, String),
+    /// A browser leaf: Home Assistant launches it (play / scene / movie).
+    Launch(String, String),
+    /// A browser folder: ask Home Assistant for children (dynamic trees).
+    Browse(String, String),
     /// A cover's position, percent open; or open or closed whole.
     Position(String, u8),
     Open(String),
@@ -1611,6 +1739,8 @@ impl Command {
             Command::Previous(id) => json!({"id": id, "action": "previous"}),
             Command::Climate(id, choice, o) => json!({"id": id, "action": choice.action(), "option": o}),
             Command::Select(id, o) => json!({"id": id, "action": "select", "option": o}),
+            Command::Launch(id, item) => json!({"id": id, "action": "launch", "item": item}),
+            Command::Browse(id, item) => json!({"id": id, "action": "browse", "item": item}),
             Command::Position(id, p) => json!({"id": id, "action": "position", "value": p}),
             Command::Open(id) => json!({"id": id, "action": "open"}),
             Command::Close(id) => json!({"id": id, "action": "close"}),

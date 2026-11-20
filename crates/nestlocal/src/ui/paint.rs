@@ -993,28 +993,28 @@ pub fn picture(canvas: &mut Canvas, rgb: &[u8], size: u32, cx: f32, cy: f32, rad
     picture_scaled(canvas, rgb, size, size, cx, cy, radius);
 }
 
-/// picture() in pixels: the picture drawn as it is, `size` pixels wide.
-fn picture_px(canvas: &mut Canvas, rgb: &[u8], size: u32, cx: f32, cy: f32, radius: f32) {
-    let (x0, y0) = ((cx - size as f32 / 2.0).round() as i32, (cy - size as f32 / 2.0).round() as i32);
-    let edge = size as f32 - radius;
+/// A (possibly rectangular) RGB picture drawn at native size in pixels.
+fn picture_px(canvas: &mut Canvas, rgb: &[u8], width: u32, height: u32, cx: f32, cy: f32, radius: f32) {
+    let (x0, y0) = ((cx - width as f32 / 2.0).round() as i32, (cy - height as f32 / 2.0).round() as i32);
+    let (edge_x, edge_y) = (width as f32 - radius, height as f32 - radius);
     let side = canvas.side as i32;
-    for y in 0..size {
+    for y in 0..height {
         let (py, fy) = (y0 + y as i32, y as f32 + 0.5);
         if !(0..side).contains(&py) {
             continue;
         }
-        for x in 0..size {
+        for x in 0..width {
             let (px, fx) = (x0 + x as i32, x as f32 + 0.5);
             if !(0..side).contains(&px) {
                 continue;
             }
             // How much of the pixel is inside the rounded corners.
-            let (ex, ey) = ((radius - fx).max(fx - edge).max(0.0), (radius - fy).max(fy - edge).max(0.0));
+            let (ex, ey) = ((radius - fx).max(fx - edge_x).max(0.0), (radius - fy).max(fy - edge_y).max(0.0));
             let cover = if ex > 0.0 && ey > 0.0 { (radius - (ex * ex + ey * ey).sqrt() + 0.5).clamp(0.0, 1.0) } else { 1.0 };
             if cover <= 0.0 {
                 continue;
             }
-            let from = 3 * (y * size + x) as usize;
+            let from = 3 * (y * width + x) as usize;
             let colour = canvas.rgb([rgb[from], rgb[from + 1], rgb[from + 2]]);
             let at = canvas.at(px as u32, py as u32);
             let data = canvas.pixmap.data_mut();
@@ -1082,26 +1082,50 @@ pub fn picture_over(canvas: &mut Canvas, rgb: &[u8], alpha: Option<&[u8]>, size:
 /// A square RGB picture `size` wide drawn `side` wide (smaller), each pixel
 /// the average of those it covers, centred on (cx, cy), corners rounded.
 pub fn picture_scaled(canvas: &mut Canvas, rgb: &[u8], size: u32, side: u32, cx: f32, cy: f32, radius: f32) {
-    let s = canvas.scale();
-    let (pixels, cx, cy, radius) = (((side.min(size) as f32) * s).round() as u32, cx * s, cy * s, radius * s);
-    if pixels >= size {
-        return picture_px(canvas, rgb, size, cx, cy, radius);
-    }
-    picture_px(canvas, &downsample(rgb, size, pixels), pixels, cx, cy, radius);
+    picture_scaled_wh(canvas, rgb, size, size, side, side, cx, cy, radius);
 }
 
-/// A square RGB picture `size` wide as `side` wide, each pixel the average
-/// of those it covers.
-fn downsample(rgb: &[u8], size: u32, side: u32) -> Vec<u8> {
-    let mut small = Vec::with_capacity((side * side * 3) as usize);
-    for y in 0..side {
-        let (y0, y1) = (y * size / side, ((y + 1) * size / side).max(y * size / side + 1));
-        for x in 0..side {
-            let (x0, x1) = (x * size / side, ((x + 1) * size / side).max(x * size / side + 1));
+/// A (possibly rectangular) picture fitted into `draw_w`×`draw_h` units.
+#[allow(clippy::too_many_arguments)]
+pub fn picture_scaled_wh(
+    canvas: &mut Canvas,
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    draw_w: u32,
+    draw_h: u32,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+) {
+    let s = canvas.scale();
+    let (out_w, out_h, cx, cy, radius) = (
+        ((draw_w.min(width) as f32) * s).round() as u32,
+        ((draw_h.min(height) as f32) * s).round() as u32,
+        cx * s,
+        cy * s,
+        radius * s,
+    );
+    if out_w == 0 || out_h == 0 {
+        return;
+    }
+    if out_w >= width && out_h >= height {
+        return picture_px(canvas, rgb, width, height, cx, cy, radius);
+    }
+    picture_px(canvas, &downsample_wh(rgb, width, height, out_w, out_h), out_w, out_h, cx, cy, radius);
+}
+
+/// Downsample RGB `width`×`height` to `out_w`×`out_h`.
+fn downsample_wh(rgb: &[u8], width: u32, height: u32, out_w: u32, out_h: u32) -> Vec<u8> {
+    let mut small = Vec::with_capacity((out_w * out_h * 3) as usize);
+    for y in 0..out_h {
+        let (y0, y1) = (y * height / out_h, ((y + 1) * height / out_h).max(y * height / out_h + 1));
+        for x in 0..out_w {
+            let (x0, x1) = (x * width / out_w, ((x + 1) * width / out_w).max(x * width / out_w + 1));
             let mut sum = [0u32; 3];
             for sy in y0..y1 {
                 for sx in x0..x1 {
-                    let at = 3 * (sy * size + sx) as usize;
+                    let at = 3 * (sy * width + sx) as usize;
                     for k in 0..3 {
                         sum[k] += rgb[at + k] as u32;
                     }

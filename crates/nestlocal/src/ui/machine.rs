@@ -317,6 +317,9 @@ pub enum Mode {
     Camera { slot: usize },
     /// A select's options, `selected` highlighted (its last row Back).
     OptionList { slot: usize, selected: usize },
+    /// A browser's items at `path` (folder ids), `selected` highlighted
+    /// (its last row Back). Long-press pops like Back.
+    BrowserList { slot: usize, path: Vec<String>, selected: usize },
     /// A thermostat's modes, fan speeds, presets or swings, listed as a
     /// select's options are (its last row Back).
     DialList { of: Dial, list: ClimateChoice, selected: usize },
@@ -373,7 +376,8 @@ impl Mode {
         match self {
             Mode::LightList { slot, .. } | Mode::LightDim { slot, .. } | Mode::LightWarmth { slot, .. }
             | Mode::LightHue { slot, .. } | Mode::Camera { slot }
-            | Mode::Volume { slot, .. } | Mode::OptionList { slot, .. } | Mode::Members { slot, .. }
+            | Mode::Volume { slot, .. } | Mode::OptionList { slot, .. } | Mode::BrowserList { slot, .. }
+            | Mode::Members { slot, .. }
             | Mode::CoverSet { slot, .. } | Mode::ActionView { slot } | Mode::FaceView { slot } | Mode::AlarmView { slot } | Mode::AlarmPad { slot, .. }
             | Mode::AlarmModes { slot, .. }
             | Mode::AlarmOpen { slot, .. } => Some(Slot::Card(*slot)),
@@ -654,6 +658,7 @@ impl Machine {
             Mode::Volume { slot, .. } => matches!(cards.cards.get(*slot), Some(Card::Media(_))),
             Mode::Camera { slot } => matches!(cards.cards.get(*slot), Some(Card::Camera(_))),
             Mode::OptionList { slot, .. } => matches!(cards.cards.get(*slot), Some(Card::Options(_))),
+            Mode::BrowserList { slot, .. } => matches!(cards.cards.get(*slot), Some(Card::Browser(_))),
             Mode::CoverSet { slot, .. } => matches!(cards.cards.get(*slot), Some(Card::Cover(_))),
             Mode::AlarmView { slot } | Mode::AlarmPad { slot, .. } | Mode::AlarmOpen { slot, .. } => {
                 matches!(cards.cards.get(*slot), Some(Card::Alarm(_)))
@@ -972,7 +977,8 @@ impl Machine {
                 let step = match self.mode {
                     Mode::Home | Mode::Chooser(_) => CARD_STEP,
                     Mode::Menu { .. } => MENU_STEP,
-                    Mode::LightList { .. } | Mode::OptionList { .. } | Mode::DialList { .. } | Mode::Members { .. }
+                    Mode::LightList { .. } | Mode::OptionList { .. } | Mode::BrowserList { .. }
+                    | Mode::DialList { .. } | Mode::Members { .. }
                     | Mode::Settings { .. } | Mode::ThemePick { .. } | Mode::Prompt { .. }
                     | Mode::AlarmPad { .. } | Mode::AlarmModes { .. } => ROW_STEP,
                     Mode::Dial { .. } | Mode::SettingSet { .. } => CLIMATE_STEP,
@@ -1265,6 +1271,13 @@ impl Machine {
                     self.mode = Mode::OptionList { slot, selected };
                 }
             }
+            Mode::BrowserList { slot, path, selected } => {
+                if let Some(Card::Browser(card)) = self.card(slot) {
+                    let rows = card.at(&path).len() as i32;
+                    let selected = (selected as i32 + steps).clamp(0, rows) as usize;
+                    self.mode = Mode::BrowserList { slot, path, selected };
+                }
+            }
             Mode::Members { slot, selected } => {
                 if let Some(Card::Lights(card)) = self.card(slot) {
                     let selected = (selected as i32 + steps).clamp(0, card.members.len() as i32) as usize;
@@ -1352,6 +1365,7 @@ impl Machine {
                         let at = card.current.as_ref().and_then(|c| card.options.iter().position(|o| o == c));
                         Mode::OptionList { slot, selected: at.unwrap_or(0) }
                     }
+                    Some(Card::Browser(_)) => Mode::BrowserList { slot, path: Vec::new(), selected: 0 },
                     Some(Card::Cover(card)) => {
                         let open = if card.state == "open" { 100 } else { 0 };
                         Mode::CoverSet { slot, value: card.position.unwrap_or(open) }
@@ -1451,6 +1465,9 @@ impl Machine {
                     }
                 }
                 self.go(Mode::Chooser(self.place(Slot::Card(slot))), out);
+            }
+            Mode::BrowserList { slot, path, selected } => {
+                self.browser_press(slot, path, selected, out);
             }
             Mode::DialList { of, list, selected } => {
                 if let Some(choice) = self.choices(of, list).0.get(selected).cloned() {
@@ -1943,6 +1960,47 @@ impl Machine {
     /// Switches a card's device the way it has: a light (`light`, or all of
     /// a card's lights, off if any is on) on or off, a media player played
     /// or paused. False if it has no such way (a thermostat, Back).
+    /// Press on a browser list: Back / enter folder / launch leaf.
+    fn browser_press(&mut self, slot: usize, mut path: Vec<String>, selected: usize, out: &mut Vec<Effect>) {
+        let (card_id, item_id, folder, empty_folder) = {
+            let Some(Card::Browser(card)) = self.card(slot) else {
+                self.go(Mode::Chooser(self.place(Slot::Card(slot))), out);
+                return;
+            };
+            let items = card.at(&path);
+            if selected >= items.len() {
+                (String::new(), String::new(), false, false) // Back row
+            } else {
+                let item = &items[selected];
+                (card.id.clone(), item.id.clone(), item.folder, item.folder && item.items.is_empty())
+            }
+        };
+        if card_id.is_empty() {
+            self.browser_back(slot, path, out);
+            return;
+        }
+        if folder {
+            // Static children: enter locally. Empty folder: ask HA (dynamic trees).
+            if empty_folder {
+                out.push(Effect::Send(Command::Browse(card_id, item_id.clone())));
+            }
+            path.push(item_id);
+            self.go(Mode::BrowserList { slot, path, selected: 0 }, out);
+            return;
+        }
+        out.push(Effect::Send(Command::Launch(card_id, item_id)));
+        self.go(Mode::Chooser(self.place(Slot::Card(slot))), out);
+    }
+
+    /// Back on a browser: pop a folder, or leave to the chooser at root.
+    fn browser_back(&mut self, slot: usize, mut path: Vec<String>, out: &mut Vec<Effect>) {
+        if path.pop().is_some() {
+            self.go(Mode::BrowserList { slot, path, selected: 0 }, out);
+        } else {
+            self.go(Mode::Chooser(self.place(Slot::Card(slot))), out);
+        }
+    }
+
     fn toggle(&mut self, slot: usize, light: Option<usize>, out: &mut Vec<Effect>) -> bool {
         match self.cards.cards.get_mut(slot) {
             Some(Card::Lights(card)) => {
@@ -2028,6 +2086,12 @@ impl Machine {
         if let Mode::AlarmModes { slot, .. } = self.mode {
             out.push(Effect::Click);
             self.go(Mode::AlarmView { slot }, out);
+            return;
+        }
+        // Browser: long-press is Back (pop folder or chooser), unlike OptionList.
+        if let Mode::BrowserList { slot, path, .. } = self.mode.clone() {
+            out.push(Effect::Click);
+            self.browser_back(slot, path, out);
             return;
         }
         if matches!(self.mode, Mode::Dial { .. } | Mode::AlarmView { .. }
@@ -3218,6 +3282,52 @@ mod tests {
         rig.press();
         rig.rows(9);
         assert!(Rig::sends(&rig.press()).is_empty() && rig.machine.mode == Mode::Chooser(1), "Back: nothing chosen");
+    }
+
+    #[test]
+    fn a_browser_launches_and_back_pops() {
+        let mut rig = deck_of(br#"{"cards":[{"kind":"browser","id":"fledge_browser.playlists","name":"Playlists",
+            "items":[{"id":"mix_1","name":"Daily Mix 1"},
+                     {"id":"rock","name":"Rock","folder":true,
+                      "items":[{"id":"mix_2","name":"Daily Mix 2"}]}]}]}"#);
+        rig.turn(CARD_STEP);
+        rig.press();
+        assert_eq!(rig.machine.mode, Mode::BrowserList { slot: 0, path: vec![], selected: 0 });
+        assert_eq!(Rig::sends(&rig.press()), vec![Command::Launch("fledge_browser.playlists".into(), "mix_1".into())]);
+        assert_eq!(rig.machine.mode, Mode::Chooser(1), "launch returns to chooser");
+
+        rig.press();
+        rig.rows(1);
+        assert!(Rig::sends(&rig.press()).is_empty(), "enter folder: no command when children are static");
+        assert_eq!(rig.machine.mode, Mode::BrowserList { slot: 0, path: vec!["rock".into()], selected: 0 });
+        assert_eq!(Rig::sends(&rig.press()), vec![Command::Launch("fledge_browser.playlists".into(), "mix_2".into())]);
+
+        rig.press();
+        rig.rows(1);
+        rig.press(); // into rock again
+        rig.rows(9); // Back row
+        assert!(Rig::sends(&rig.press()).is_empty());
+        assert_eq!(rig.machine.mode, Mode::BrowserList { slot: 0, path: vec![], selected: 0 }, "Back pops to root");
+        rig.input(Input::LongPress);
+        assert_eq!(rig.machine.mode, Mode::Chooser(1), "long-press at root leaves to chooser");
+    }
+
+    #[test]
+    fn cover_mode_still_launches_and_backs_like_the_list() {
+        let mut rig = deck_of(br#"{"cards":[{"kind":"browser","id":"fledge_browser.playlists","name":"Playlists",
+            "mode":"cover",
+            "items":[{"id":"mix_1","name":"Daily Mix 1","art":"fledge_browser.playlists:mix_1"},
+                     {"id":"mix_2","name":"Daily Mix 2"}]}]}"#);
+        rig.turn(CARD_STEP);
+        rig.press();
+        assert_eq!(rig.machine.mode, Mode::BrowserList { slot: 0, path: vec![], selected: 0 });
+        rig.rows(1);
+        assert_eq!(Rig::sends(&rig.press()), vec![Command::Launch("fledge_browser.playlists".into(), "mix_2".into())]);
+        assert_eq!(rig.machine.mode, Mode::Chooser(1));
+        rig.press();
+        rig.rows(9); // Back
+        assert!(Rig::sends(&rig.press()).is_empty());
+        assert_eq!(rig.machine.mode, Mode::Chooser(1));
     }
 
     #[test]
